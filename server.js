@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * L3 MARKETS - Official Exness API & Partner Gateway Engine
- * Production Mode • Zero Simulation • Full API Integration
+ * Production Mode • Zero Simulation • 100% API-Driven
  * ============================================================================
  */
 
@@ -88,21 +88,20 @@ app.get('/health', (req, res) => {
  */
 app.get('/api/exness/instruments', async (req, res) => {
     try {
-        const response = await axios.get(`${EXNESS_BASE_URL}/v1/trading/symbols`, {
+        const response = await axios.post(`${EXNESS_BASE_URL}/v1/trading/symbols/list`, {}, {
             headers: createExnessAuthHeaders({})
         });
         res.json({ success: true, instruments: response.data.symbols || response.data });
     } catch (error) {
-        // Fallback dynamic query to Exness partner schema if standard symbol endpoint requires direct user token
         try {
-            const fallbackRes = await axios.get(`${EXNESS_BASE_URL}/v1/markets/instruments`, {
+            const fallbackRes = await axios.post(`${EXNESS_BASE_URL}/v1/markets/instruments`, {}, {
                 headers: createExnessAuthHeaders({})
             });
             res.json({ success: true, instruments: fallbackRes.data });
         } catch (err) {
             res.status(500).json({ 
                 success: false, 
-                message: 'Failed to fetch live instrument catalog from Exness API. Verify environment keys.' 
+                message: 'Failed to fetch live instrument catalog from Exness API.' 
             });
         }
     }
@@ -110,6 +109,7 @@ app.get('/api/exness/instruments', async (req, res) => {
 
 /**
  * 2. Authentic Client Login (Credentials Authentication via Exness API)
+ * Fixed to use POST for both auth and account detail fetching
  */
 app.post('/api/exness/login', async (req, res) => {
     const { email, password } = req.body;
@@ -122,7 +122,6 @@ app.post('/api/exness/login', async (req, res) => {
         const payload = { email, password };
         const authHeaders = createExnessAuthHeaders(payload, `login_${Date.now()}`);
 
-        // Authenticate against Exness Partner/Client API Gateway
         const exnessResponse = await axios.post(`${EXNESS_AFFILIATE_URL}/api/auth`, payload, {
             headers: authHeaders,
             timeout: 10000
@@ -130,12 +129,13 @@ app.post('/api/exness/login', async (req, res) => {
 
         const token = exnessResponse.data.token || exnessResponse.data.access_token;
 
-        // Fetch true client account details and exact balances using the obtained bearer token
-        const accountsResponse = await axios.get(`${EXNESS_BASE_URL}/v1/clients/accounts`, {
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'EXN-API-KEY': EXNESS_API_KEY
-            }
+        // Fetch client account details using signed POST request
+        const accountsPayload = { email };
+        const accountsHeaders = createExnessAuthHeaders(accountsPayload, `acc_${Date.now()}`);
+        accountsHeaders['Authorization'] = `Bearer ${token}`;
+
+        const accountsResponse = await axios.post(`${EXNESS_BASE_URL}/v1/clients/accounts/list`, accountsPayload, {
+            headers: accountsHeaders
         });
 
         res.json({
@@ -156,22 +156,21 @@ app.post('/api/exness/login', async (req, res) => {
 });
 
 /**
- * 3. Session Refresh & Balance Synchronization
+ * 3. Session Refresh & Balance Synchronization (Fixed to POST)
  */
 app.post('/api/exness/refresh-session', async (req, res) => {
-    const { token } = req.body;
+    const { token, email } = req.body;
 
     if (!token) {
         return res.status(401).json({ success: false, message: 'Session token required.' });
     }
 
     try {
-        const accountsResponse = await axios.get(`${EXNESS_BASE_URL}/v1/clients/accounts`, {
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'EXN-API-KEY': EXNESS_API_KEY
-            }
-        });
+        const payload = { email };
+        const headers = createExnessAuthHeaders(payload, `refresh_${Date.now()}`);
+        headers['Authorization'] = `Bearer ${token}`;
+
+        const accountsResponse = await axios.post(`${EXNESS_BASE_URL}/v1/clients/accounts/list`, payload, { headers });
 
         res.json({
             success: true,
@@ -179,33 +178,6 @@ app.post('/api/exness/refresh-session', async (req, res) => {
         });
     } catch (error) {
         res.status(401).json({ success: false, message: 'Exness session expired.' });
-    }
-});
-
-/**
- * 4. Place Trade & Order Management Managed by Exness API
- */
-app.post('/api/exness/trade', async (req, res) => {
-    const { token, symbol, volume, orderType, price } = req.body;
-
-    if (!token || !symbol || !volume || !orderType) {
-        return res.status(400).json({ success: false, message: 'Missing order execution parameters.' });
-    }
-
-    try {
-        const payload = { symbol, volume, orderType, price };
-        const headers = createExnessAuthHeaders(payload, `order_${Date.now()}`);
-        headers['Authorization'] = `Bearer ${token}`;
-
-        const orderResponse = await axios.post(`${EXNESS_BASE_URL}/v1/trading/orders`, payload, { headers });
-
-        res.json({
-            success: true,
-            message: 'Trade executed successfully through Exness API.',
-            order: orderResponse.data
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.response?.data?.message || 'Trade execution failed via Exness gateway.' });
     }
 });
 
