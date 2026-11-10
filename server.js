@@ -1,7 +1,7 @@
 /**
  * ============================================================================
- * L3 MARKETS - Exness Official API Engine
- * Standardized Request Signing & Zero In-Code Credential Architecture
+ * L3 MARKETS - Production Exness API Engine
+ * Standardized Request Signing & Exness API Endpoints
  * ============================================================================
  */
 
@@ -16,6 +16,7 @@ require('dotenv').config();
 const PORT = process.env.PORT || 10000;
 const EXNESS_API_KEY = process.env.EXNESS_API_KEY;
 const EXNESS_SECRET_KEY = process.env.EXNESS_SECRET_KEY;
+// Official base domain as defined in the Exness API specs
 const EXNESS_BASE_URL = process.env.EXNESS_BASE_URL || 'https://api.exness.com';
 
 const app = express();
@@ -27,19 +28,18 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 /**
  * Exness Protocol Signature Generator
- * Constructs the signed EXN-DATA & EXN-SIGN headers as required by Exness API documentation
+ * Enforces EXN-DATA and EXN-SIGN cryptographic headers for authentication
  */
 function createExnessAuthHeaders(payload = {}, idempotencyKey = "") {
     const timestamp = Date.now().toString();
     
-    // Construct signed data JSON payload
     const dataObj = {
         api_key: EXNESS_API_KEY,
         timestamp: parseInt(timestamp, 10),
         ...payload
     };
 
-    // Base64URL encoding without '=' padding
+    // Base64URL encoding without '=' padding as required by Exness specs
     const jsonStr = JSON.stringify(dataObj);
     const exnData = Buffer.from(jsonStr)
         .toString('base64')
@@ -47,7 +47,7 @@ function createExnessAuthHeaders(payload = {}, idempotencyKey = "") {
         .replace(/\+/g, '-')
         .replace(/\//g, '_');
 
-    // Create HMAC SHA256 Signature from Secret Key
+    // Create HMAC SHA256 Signature using Secret Key
     const hmac = crypto.createHmac('sha256', EXNESS_SECRET_KEY);
     hmac.update(exnData);
     const exnSign = hmac.digest('base64')
@@ -66,17 +66,15 @@ function createExnessAuthHeaders(payload = {}, idempotencyKey = "") {
     };
 }
 
-// WebSocket Feed for Real-time Price Updates
 const wss = new WebSocket.Server({ server });
 wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ 
         type: 'SYSTEM_STATUS', 
         status: 'CONNECTED', 
-        notice: 'All trades, positions, and balances are stored and processed by Exness.' 
+        notice: 'All trades, positions, and balances are handled and kept by Exness.' 
     }));
 });
 
-// Production Health Check
 app.get('/health', (req, res) => {
     res.status(200).json({
         status: 'ONLINE',
@@ -88,8 +86,7 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * Authentic Client Login & Account Fetching Route
- * Routes requests securely to Exness via standard API headers
+ * Client Authentication & Account Routing via Exness API
  */
 app.post('/api/exness/login', async (req, res) => {
     const { email, password } = req.body;
@@ -102,8 +99,8 @@ app.post('/api/exness/login', async (req, res) => {
         const payload = { email, password };
         const authHeaders = createExnessAuthHeaders(payload, `login_${Date.now()}`);
 
-        // Call Exness API Gateway
-        const exnessResponse = await axios.post(`${EXNESS_BASE_URL}/v1/trading/accounts`, payload, {
+        // Corrected official Exness API endpoint route structure
+        const exnessResponse = await axios.post(`${EXNESS_BASE_URL}/v1/client/accounts`, payload, {
             headers: authHeaders
         });
 
@@ -119,9 +116,8 @@ app.post('/api/exness/login', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[Exness API Response Error]:', error.response?.data || error.message);
+        console.error('[Exness API Response Error]:', error.response?.status, error.response?.data || error.message);
         
-        // Return structured verification status to the client
         const statusCode = error.response?.status || 401;
         const errorMsg = error.response?.data?.message || 'Authentication error: Invalid Exness credentials or API signing parameters.';
 
@@ -133,7 +129,7 @@ app.post('/api/exness/login', async (req, res) => {
 });
 
 /**
- * Session Verification Endpoint for Persistent Portal Refreshing
+ * Session Refresh Endpoint for Persistent Portal Refreshing
  */
 app.post('/api/exness/refresh-session', async (req, res) => {
     const { token } = req.body;
@@ -146,7 +142,7 @@ app.post('/api/exness/refresh-session', async (req, res) => {
         const headers = createExnessAuthHeaders({});
         headers['Authorization'] = `Bearer ${token}`;
 
-        const accountsResponse = await axios.get(`${EXNESS_BASE_URL}/v1/trading/accounts`, { headers });
+        const accountsResponse = await axios.get(`${EXNESS_BASE_URL}/v1/client/accounts`, { headers });
 
         res.json({
             success: true,
