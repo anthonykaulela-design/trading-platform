@@ -1,7 +1,7 @@
 /**
  * ============================================================================
- * L3 MARKETS - Official Exness API Trading & Data Proxy Engine
- * Zero Simulation • Direct Exness REST & WebSocket API Integration
+ * L3 MARKETS - Official Exness API & Partner Gateway Engine
+ * Production Mode • Zero Simulation • Full API Integration
  * ============================================================================
  */
 
@@ -17,6 +17,7 @@ const PORT = process.env.PORT || 10000;
 const EXNESS_API_KEY = process.env.EXNESS_API_KEY;
 const EXNESS_SECRET_KEY = process.env.EXNESS_SECRET_KEY;
 const EXNESS_BASE_URL = process.env.EXNESS_BASE_URL || 'https://api.exness.com';
+const EXNESS_AFFILIATE_URL = 'https://my.exnessaffiliates.com';
 
 const app = express();
 const server = http.createServer(app);
@@ -43,7 +44,7 @@ function createExnessAuthHeaders(payload = {}, idempotencyKey = "") {
         .replace(/\+/g, '-')
         .replace(/\//g, '_');
 
-    const hmac = crypto.createHmac('sha256', EXNESS_SECRET_KEY);
+    const hmac = crypto.createHmac('sha256', EXNESS_SECRET_KEY || 'l3_secure');
     hmac.update(exnData);
     const exnSign = hmac.digest('base64')
         .replace(/=/g, '')
@@ -61,7 +62,7 @@ function createExnessAuthHeaders(payload = {}, idempotencyKey = "") {
     };
 }
 
-// WebSocket proxy for live market feeds direct from Exness
+// WebSocket real-time broadcast server
 const wss = new WebSocket.Server({ server });
 wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ 
@@ -83,138 +84,134 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * 1. Fetch All Trading Symbols, Commodities, Indices, Metals & Crypto directly from Exness API
+ * 1. Fetch Live Symbols & Markets Directly from Exness API Catalog
  */
-app.get('/api/exness/symbols', async (req, res) => {
+app.get('/api/exness/instruments', async (req, res) => {
     try {
-        const headers = createExnessAuthHeaders({});
-        const response = await axios.get(`${EXNESS_BASE_URL}/v1/trading/symbols`, { headers, timeout: 8000 });
-        res.json({ success: true, symbols: response.data.symbols || response.data.items || [] });
-    } catch (error) {
-        console.error('[Exness Symbols API Error]:', error.response?.data || error.message);
-        res.status(500).json({ success: false, message: 'Failed to fetch symbols from Exness API.' });
-    }
-});
-
-/**
- * 2. Fetch Live Candlesticks & Chart Data directly from Exness API
- */
-app.get('/api/exness/candles/:symbol', async (req, res) => {
-    const { symbol } = req.params;
-    const { timeframe = '1m', limit = '50' } = req.query;
-
-    try {
-        const headers = createExnessAuthHeaders({ symbol, timeframe, limit });
-        const response = await axios.get(`${EXNESS_BASE_URL}/v1/market/candles`, {
-            params: { symbol, timeframe, limit },
-            headers,
-            timeout: 8000
+        const response = await axios.get(`${EXNESS_BASE_URL}/v1/trading/symbols`, {
+            headers: createExnessAuthHeaders({})
         });
-        res.json({ success: true, candles: response.data.candles || response.data.items || [] });
+        res.json({ success: true, instruments: response.data.symbols || response.data });
     } catch (error) {
-        console.error('[Exness Candles API Error]:', error.response?.data || error.message);
-        res.status(500).json({ success: false, message: 'Failed to fetch candlestick data from Exness API.' });
-    }
-});
-
-/**
- * 3. Authenticate Client & Fetch Exact Account Balances and Account IDs via Exness API
- */
-app.post('/api/exness/login', async (req, res) => {
-    const { apiKey, apiSecret, accountId, isDemo } = req.body;
-
-    if (!apiKey || !accountNumber) {
-        // Fallback to primary API keys in env if user provides Exness account credentials
-        const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(400).json({ success: false, message: 'Exness API credentials or account details required.' });
+        // Fallback dynamic query to Exness partner schema if standard symbol endpoint requires direct user token
+        try {
+            const fallbackRes = await axios.get(`${EXNESS_BASE_URL}/v1/markets/instruments`, {
+                headers: createExnessAuthHeaders({})
+            });
+            res.json({ success: true, instruments: fallbackRes.data });
+        } catch (err) {
+            res.status(500).json({ 
+                success: false, 
+                message: 'Failed to fetch live instrument catalog from Exness API. Verify environment keys.' 
+            });
         }
     }
-
-    try {
-        const payload = { accountId, isDemo: !!isDemo };
-        const headers = createExnessAuthHeaders(payload, `auth_${Date.now()}`);
-
-        const response = await axios.post(`${EXNESS_BASE_URL}/v1/trading/accounts`, payload, {
-            headers,
-            timeout: 10000
-        });
-
-        res.json({
-            success: true,
-            token: response.data.token || response.data.access_token || `exn_sess_${Date.now()}`,
-            accounts: response.data.accounts || response.data.items || []
-        });
-    } catch (error) {
-        console.error('[Exness Auth API Error]:', error.response?.data || error.message);
-        res.status(error.response?.status || 401).json({
-            success: false,
-            message: error.response?.data?.message || 'Exness API authentication failed.'
-        });
-    }
 });
 
 /**
- * 4. Place and Manage Trades directly through Exness Trading API
+ * 2. Authentic Client Login (Credentials Authentication via Exness API)
  */
-app.post('/api/exness/trade', async (req, res) => {
-    const { accountId, symbol, volume, orderType, price, stopLoss, takeProfit } = req.body;
+app.post('/api/exness/login', async (req, res) => {
+    const { email, password } = req.body;
 
-    if (!accountId || !symbol || !volume || !orderType) {
-        return res.status(400).json({ success: false, message: 'Missing required order execution parameters.' });
+    if (!email || !password) {
+        return res.status(400).json({ success: false, message: 'Exness email and password are required.' });
     }
 
     try {
-        const payload = { accountId, symbol, volume, orderType, price, stopLoss, takeProfit };
-        const headers = createExnessAuthHeaders(payload, `order_${Date.now()}`);
+        const payload = { email, password };
+        const authHeaders = createExnessAuthHeaders(payload, `login_${Date.now()}`);
 
-        const response = await axios.post(`${EXNESS_BASE_URL}/v1/trading/orders`, payload, {
-            headers,
+        // Authenticate against Exness Partner/Client API Gateway
+        const exnessResponse = await axios.post(`${EXNESS_AFFILIATE_URL}/api/auth`, payload, {
+            headers: authHeaders,
             timeout: 10000
+        });
+
+        const token = exnessResponse.data.token || exnessResponse.data.access_token;
+
+        // Fetch true client account details and exact balances using the obtained bearer token
+        const accountsResponse = await axios.get(`${EXNESS_BASE_URL}/v1/clients/accounts`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'EXN-API-KEY': EXNESS_API_KEY
+            }
         });
 
         res.json({
             success: true,
-            notice: 'All trades and executions are managed and kept directly by Exness.',
-            order: response.data
+            token: token,
+            user: email,
+            notice: 'All trades and data are handled and kept by Exness.',
+            accounts: accountsResponse.data.accounts || accountsResponse.data.items || []
         });
+
     } catch (error) {
-        console.error('[Exness Trade Execution Error]:', error.response?.data || error.message);
-        res.status(500).json({
+        console.error('[Exness API Auth Error]:', error.response?.data || error.message);
+        res.status(401).json({
             success: false,
-            message: error.response?.data?.message || 'Trade execution rejected by Exness API.'
+            message: error.response?.data?.message || 'Exness API authentication failed. Invalid credentials or API restrictions.'
         });
     }
 });
 
 /**
- * 5. Session Refresh & Balance Synchronization
+ * 3. Session Refresh & Balance Synchronization
  */
 app.post('/api/exness/refresh-session', async (req, res) => {
-    const { token, accountId } = req.body;
+    const { token } = req.body;
 
     if (!token) {
         return res.status(401).json({ success: false, message: 'Session token required.' });
     }
 
     try {
-        const headers = createExnessAuthHeaders({ accountId });
-        headers['Authorization'] = `Bearer ${token}`;
-
-        const response = await axios.get(`${EXNESS_BASE_URL}/v1/trading/accounts`, { headers });
+        const accountsResponse = await axios.get(`${EXNESS_BASE_URL}/v1/clients/accounts`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'EXN-API-KEY': EXNESS_API_KEY
+            }
+        });
 
         res.json({
             success: true,
-            accounts: response.data.accounts || response.data.items || []
+            accounts: accountsResponse.data.accounts || accountsResponse.data.items || []
         });
     } catch (error) {
         res.status(401).json({ success: false, message: 'Exness session expired.' });
     }
 });
 
+/**
+ * 4. Place Trade & Order Management Managed by Exness API
+ */
+app.post('/api/exness/trade', async (req, res) => {
+    const { token, symbol, volume, orderType, price } = req.body;
+
+    if (!token || !symbol || !volume || !orderType) {
+        return res.status(400).json({ success: false, message: 'Missing order execution parameters.' });
+    }
+
+    try {
+        const payload = { symbol, volume, orderType, price };
+        const headers = createExnessAuthHeaders(payload, `order_${Date.now()}`);
+        headers['Authorization'] = `Bearer ${token}`;
+
+        const orderResponse = await axios.post(`${EXNESS_BASE_URL}/v1/trading/orders`, payload, { headers });
+
+        res.json({
+            success: true,
+            message: 'Trade executed successfully through Exness API.',
+            order: orderResponse.data
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.response?.data?.message || 'Trade execution failed via Exness gateway.' });
+    }
+});
+
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`============================================================`);
-    console.log(` L3 Markets Exness API Engine active on port ${PORT}`);
-    console.log(` Notice: All data and trades are managed by Exness.`);
+    console.log(` L3 Markets Production Engine active on port ${PORT}`);
+    console.log(` Mode: 100% Exness API Driven (Zero Simulation)`);
     console.log(`============================================================`);
 });
