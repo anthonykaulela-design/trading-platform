@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * L3 MARKETS - Official Exness API & Partner Gateway Engine
- * Production Mode • Zero Simulation • Strict POST & No-Redirect Conversion
+ * Production Mode & Direct API Routing
  * ============================================================================
  */
 
@@ -17,7 +17,6 @@ const PORT = process.env.PORT || 10000;
 const EXNESS_API_KEY = process.env.EXNESS_API_KEY;
 const EXNESS_SECRET_KEY = process.env.EXNESS_SECRET_KEY;
 const EXNESS_BASE_URL = process.env.EXNESS_BASE_URL || 'https://api.exness.com';
-const EXNESS_AFFILIATE_URL = 'https://my.exnessaffiliates.com';
 
 const app = express();
 const server = http.createServer(app);
@@ -62,7 +61,6 @@ function createExnessAuthHeaders(payload = {}, idempotencyKey = "") {
     };
 }
 
-// WebSocket real-time broadcast server
 const wss = new WebSocket.Server({ server });
 wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ 
@@ -72,7 +70,6 @@ wss.on('connection', (ws) => {
     }));
 });
 
-// Health check endpoint
 app.get('/health', (req, res) => {
     res.status(200).json({
         status: 'ONLINE',
@@ -84,17 +81,15 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * 1. Fetch Live Symbols & Markets Directly from Exness API Catalog
+ * 1. Fetch Live Symbols & Markets from Exness API
  */
 app.post('/api/exness/instruments', async (req, res) => {
     try {
         const response = await axios.post(`${EXNESS_BASE_URL}/v1/trading/symbols/list`, {}, {
-            headers: createExnessAuthHeaders({}),
-            maxRedirects: 0
+            headers: createExnessAuthHeaders({})
         });
         res.json({ success: true, instruments: response.data.symbols || response.data });
     } catch (error) {
-        // Exhaustive fallback instrument catalog aligned with Exness specifications
         res.json({
             success: true,
             instruments: {
@@ -148,9 +143,9 @@ app.post('/api/exness/login', async (req, res) => {
         const payload = { email, password };
         const authHeaders = createExnessAuthHeaders(payload, `login_${Date.now()}`);
 
-        const exnessResponse = await axios.post(`${EXNESS_AFFILIATE_URL}/api/auth`, payload, {
+        // Route strictly through official Exness API Gateway endpoint
+        const exnessResponse = await axios.post(`${EXNESS_BASE_URL}/v1/clients/authenticate`, payload, {
             headers: authHeaders,
-            maxRedirects: 0,
             timeout: 10000
         });
 
@@ -161,8 +156,7 @@ app.post('/api/exness/login', async (req, res) => {
         accountsHeaders['Authorization'] = `Bearer ${token}`;
 
         const accountsResponse = await axios.post(`${EXNESS_BASE_URL}/v1/clients/accounts/list`, accountsPayload, {
-            headers: accountsHeaders,
-            maxRedirects: 0
+            headers: accountsHeaders
         });
 
         res.json({
@@ -174,10 +168,14 @@ app.post('/api/exness/login', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[Exness API Auth Error]:', error.response?.data || error.message);
-        res.status(401).json({
+        console.error('[Exness API Auth Error]:', error.response?.status, error.response?.data || error.message);
+        
+        const statusCode = error.response?.status || 401;
+        const errorMsg = error.response?.data?.message || 'Exness API authentication failed. Verify API key privileges and credentials.';
+
+        res.status(statusCode).json({
             success: false,
-            message: error.response?.data?.message || 'Exness API authentication failed. Verify credentials and API key permissions.'
+            message: errorMsg
         });
     }
 });
@@ -197,10 +195,7 @@ app.post('/api/exness/refresh-session', async (req, res) => {
         const headers = createExnessAuthHeaders(payload, `refresh_${Date.now()}`);
         headers['Authorization'] = `Bearer ${token}`;
 
-        const accountsResponse = await axios.post(`${EXNESS_BASE_URL}/v1/clients/accounts/list`, payload, {
-            headers,
-            maxRedirects: 0
-        });
+        const accountsResponse = await axios.post(`${EXNESS_BASE_URL}/v1/clients/accounts/list`, payload, { headers });
 
         res.json({
             success: true,
@@ -214,6 +209,6 @@ app.post('/api/exness/refresh-session', async (req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`============================================================`);
     console.log(` L3 Markets Production Engine active on port ${PORT}`);
-    console.log(` Mode: 100% Exness API Driven (Redirect Method Lock Enabled)`);
+    console.log(` Mode: 100% Exness API Driven (Direct Gateway Routing)`);
     console.log(`============================================================`);
 });
