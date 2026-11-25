@@ -364,6 +364,35 @@ app.post('/api/exness/refresh-session', async (req, res) => {
     });
 });
 
+
+
+app.get('/api/exness/debug-candles', async (req, res) => {
+    const symbol = String(req.query.symbol || 'EURUSD').trim().toUpperCase();
+    const timeframe = String(req.query.timeframe || '1m').trim();
+    const accountId = String(req.query.account_id || DEFAULT_ACCOUNT_ID || '').trim();
+    const host = resolvedAccessPointUrl || BASE_URL;
+
+    const testPaths = [
+        `/v1/trading/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=50${accountId ? `&account_id=${encodeURIComponent(accountId)}` : ''}`,
+        `/v1/trading/instruments?account_id=${encodeURIComponent(accountId)}`
+    ];
+
+    const results = [];
+    for (const pathAndQuery of testPaths) {
+        try {
+            const r = await signedExnessGet(host, pathAndQuery);
+            results.push({ pathAndQuery, status: r.status, keys: Object.keys(r.data || {}), sample: r.data });
+        } catch (err) {
+            results.push({
+                pathAndQuery,
+                status: err.response?.status || 'ERR',
+                error: err.response?.data || err.message
+            });
+        }
+    }
+
+    res.json({ host, accountConfigured: Boolean(accountId), results });
+});
 app.get('/api/exness/candles', async (req, res) => {
     const symbol = String(req.query.symbol || 'EURUSD').trim().toUpperCase();
     const timeframe = String(req.query.timeframe || '1m').trim();
