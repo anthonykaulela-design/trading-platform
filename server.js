@@ -1,7 +1,8 @@
 /**
  * ============================================================================
  * L3 MARKETS - Exness Backend Engine
- * All API keys, secrets, and base URLs are loaded strictly from .env
+ * Sign In with Email/Password • Live Account Balance & Trading Data • Trade Execution
+ * Credentials & Base URLs loaded strictly from .env
  * ============================================================================
  */
 
@@ -105,6 +106,85 @@ async function resolveAccessPoint(accountId, apiKey = EXNESS_API_KEY, secretKey 
     throw lastError || new Error('Unable to resolve Exness access point.');
 }
 
+async function fetchExnessAccountAndTrades(accountId, fallbackLabel = 'Exness Account') {
+    let accountRecord = {
+        login: accountId || fallbackLabel,
+        accountType: 'Exness',
+        currency: 'USD',
+        balance: 0,
+        equity: 0,
+        margin: 0,
+        freeMargin: 0,
+        status: accountId ? 'Pending Gateway Sync' : 'Set EXNESS_ACCOUNT_ID in .env'
+    };
+
+    let trades = [];
+    let accessPoint = resolvedAccessPointUrl || BASE_URL;
+
+    if (!accountId || !EXNESS_API_KEY || !EXNESS_SECRET_KEY) {
+        return { account: accountRecord, trades, accessPoint };
+    }
+
+    try {
+        const discovery = await resolveAccessPoint(accountId);
+        accessPoint = discovery.accessPoint;
+
+        const accountPath = `/v1/trading/accounts/${encodeURIComponent(accountId)}`;
+        const accHeaders = createExnessAuthHeaders(EXNESS_API_KEY, EXNESS_SECRET_KEY, 'GET', accountPath);
+        const accRes = await axios.get(`${accessPoint}${accountPath}`, {
+            headers: accHeaders,
+            maxRedirects: 0,
+            timeout: 10000
+        });
+
+        const d = accRes.data?.data || accRes.data || {};
+        const bal = Number(d.balance ?? 0);
+        const eq = Number(d.equity ?? bal);
+
+        accountRecord = {
+            login: d.login || d.account_id || accountId,
+            accountType: d.account_type || d.type || 'Exness Trader API',
+            currency: d.currency || 'USD',
+            balance: bal,
+            equity: eq,
+            margin: Number(d.margin ?? 0),
+            freeMargin: Number(d.free_margin ?? d.freeMargin ?? Math.max(0, eq - Number(d.margin ?? 0))),
+            status: d.status || 'Connected'
+        };
+    } catch (err) {
+        console.warn('[L3 Markets Account Fetch]:', err.response?.status, err.response?.data || err.message);
+        accountRecord.status = `Gateway Notice (${err.response?.status || 'Offline'})`;
+    }
+
+    try {
+        const positionsPath = `/v1/trading/accounts/${encodeURIComponent(accountId)}/positions`;
+        const posHeaders = createExnessAuthHeaders(EXNESS_API_KEY, EXNESS_SECRET_KEY, 'GET', positionsPath);
+        const posRes = await axios.get(`${accessPoint}${positionsPath}`, {
+            headers: posHeaders,
+            maxRedirects: 0,
+            timeout: 10000
+        });
+
+        const rawList = Array.isArray(posRes.data)
+            ? posRes.data
+            : posRes.data?.positions || posRes.data?.trades || posRes.data?.items || [];
+
+        trades = rawList.map((p, idx) => ({
+            id: p.id || p.ticket || p.order_id || `POS-${idx + 1}`,
+            symbol: p.symbol || 'EURUSD',
+            side: String(p.side || p.type || 'buy').toUpperCase(),
+            volume: Number(p.volume ?? p.lots ?? 0.01),
+            openPrice: Number(p.open_price ?? p.openPrice ?? p.price ?? 0),
+            profit: Number(p.profit ?? p.pnl ?? 0),
+            status: p.status || 'OPEN'
+        }));
+    } catch (err) {
+        console.warn('[L3 Markets Positions Fetch]:', err.response?.status, err.response?.data || err.message);
+    }
+
+    return { account: accountRecord, trades, accessPoint };
+}
+
 const wss = new WebSocket.Server({ server });
 wss.on('connection', (ws) => {
     ws.send(
@@ -136,15 +216,13 @@ app.get('/health', async (req, res) => {
         baseUrl: BASE_URL,
         discoveryBaseUrl: DISCOVERY_BASE_URL,
         accessPointUrl: resolvedAccessPointUrl || null,
+        accountConfigured: Boolean(DEFAULT_ACCOUNT_ID),
         credentialsLoadedFromEnv: Boolean(EXNESS_API_KEY && EXNESS_SECRET_KEY),
         notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.',
         timestamp: new Date().toISOString()
     });
 });
 
-/**
- * 1. Access Point Discovery Endpoint
- */
 app.get('/api/exness/access-point', async (req, res) => {
     const accountId = String(req.query.account_id || DEFAULT_ACCOUNT_ID || '').trim();
     if (!accountId) {
@@ -168,11 +246,12 @@ app.get('/api/exness/access-point', async (req, res) => {
 });
 
 /**
- * 2. Client Sign In with Exness Email & Password
+ * Client Sign In with Exness Email & Password + Load Account Balance & Trading Data
  */
 app.post('/api/exness/login', async (req, res) => {
     const email = String(req.body.email || '').trim();
     const password = String(req.body.password || '');
+    const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
 
     if (!email || !password) {
         return res.status(400).json({
@@ -182,88 +261,49 @@ app.post('/api/exness/login', async (req, res) => {
     }
 
     const sessionToken = `l3_session_${crypto.randomBytes(16).toString('hex')}`;
-    const accountId = String(DEFAULT_ACCOUNT_ID || '').trim();
-    const accountLabel = accountId || email;
-
-    let accountRecord = {
-        login: accountLabel,
-        accountType: 'Exness',
-        currency: 'USD',
-        balance: 0,
-        equity: 0,
-        status: 'Signed In'
-    };
-
-    if (accountId && EXNESS_API_KEY && EXNESS_SECRET_KEY) {
-        try {
-            const discovery = await resolveAccessPoint(accountId);
-            const accountPath = `/v1/trading/accounts/${encodeURIComponent(accountId)}`;
-            const headers = createExnessAuthHeaders(EXNESS_API_KEY, EXNESS_SECRET_KEY, 'GET', accountPath);
-            const accRes = await axios.get(`${discovery.accessPoint}${accountPath}`, {
-                headers,
-                maxRedirects: 0,
-                timeout: 10000
-            });
-            const data = accRes.data || {};
-            accountRecord = {
-                login: data.login || data.account_id || accountId,
-                accountType: data.account_type || data.type || 'Exness',
-                currency: data.currency || 'USD',
-                balance: data.balance ?? 0,
-                equity: data.equity ?? data.balance ?? 0,
-                status: data.status || 'Active'
-            };
-        } catch (err) {
-            console.warn('[L3 Markets Account Sync]:', err.response?.status, err.response?.data || err.message);
-        }
-    }
+    const synced = await fetchExnessAccountAndTrades(accountId, email);
 
     res.json({
         success: true,
         platform: 'L3 Markets',
         token: sessionToken,
         user: email,
+        account_id: accountId || null,
         base_url: BASE_URL,
-        access_point: resolvedAccessPointUrl || BASE_URL,
+        access_point: synced.accessPoint,
         notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.',
-        accounts: [accountRecord]
+        accounts: [synced.account],
+        trades: synced.trades
     });
 });
 
 /**
- * 3. Session Refresh
+ * Refresh Session, Account Balance & Open Trading Data
  */
 app.post('/api/exness/refresh-session', async (req, res) => {
     const token = String(req.body.token || '').trim();
     const email = String(req.body.email || '').trim();
+    const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
 
     if (!token) {
         return res.status(401).json({ success: false, message: 'Session token required.' });
     }
 
-    const accountId = String(DEFAULT_ACCOUNT_ID || '').trim();
-    const accountLabel = accountId || email || 'Exness Account';
+    const synced = await fetchExnessAccountAndTrades(accountId, email || 'Exness Account');
 
     res.json({
         success: true,
         user: email || null,
+        account_id: accountId || null,
         base_url: BASE_URL,
-        access_point: resolvedAccessPointUrl || BASE_URL,
-        accounts: [
-            {
-                login: accountLabel,
-                accountType: 'Exness',
-                currency: 'USD',
-                balance: 0,
-                equity: 0,
-                status: 'Active'
-            }
-        ]
+        access_point: synced.accessPoint,
+        accounts: [synced.account],
+        trades: synced.trades
     });
 });
 
 /**
- * 4. Instruments Catalog
+ * Instruments Catalog
  */
 app.post('/api/exness/instruments', async (req, res) => {
     const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
@@ -313,36 +353,41 @@ app.post('/api/exness/instruments', async (req, res) => {
 });
 
 /**
- * 5. Order Execution
+ * Market Trade Execution (BUY / SELL) via Exness Trader API
  */
 app.post('/api/exness/trade', async (req, res) => {
     const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
-    const { symbol, volume, orderType, price } = req.body;
+    const symbol = String(req.body.symbol || '').trim().toUpperCase();
+    const volume = Number(req.body.volume);
+    const side = String(req.body.side || req.body.orderType || '').trim().toLowerCase();
+    const sl = req.body.sl !== undefined && req.body.sl !== '' ? Number(req.body.sl) : undefined;
+    const tp = req.body.tp !== undefined && req.body.tp !== '' ? Number(req.body.tp) : undefined;
 
-    if (!symbol || !volume || !orderType) {
+    if (!symbol || !Number.isFinite(volume) || volume <= 0 || !['buy', 'sell'].includes(side)) {
         return res.status(400).json({
             success: false,
-            message: 'symbol, volume, and orderType are required.'
+            message: 'Valid symbol, positive volume, and side (buy or sell) are required.'
         });
     }
 
-    const targetAccountId = accountId || DEFAULT_ACCOUNT_ID;
-    if (!targetAccountId) {
+    if (!accountId || !EXNESS_API_KEY || !EXNESS_SECRET_KEY) {
         return res.status(400).json({
             success: false,
-            message: 'No target Exness account ID configured for order execution.'
+            message: 'EXNESS_ACCOUNT_ID and API credentials must be configured in .env for market execution.'
         });
     }
 
     try {
-        const discovery = await resolveAccessPoint(targetAccountId);
+        const discovery = await resolveAccessPoint(accountId);
         const orderPath = '/v1/trading/orders';
         const body = {
-            account_id: targetAccountId,
+            account_id: accountId,
             symbol,
             volume,
-            side: String(orderType).toLowerCase(),
-            ...(price ? { price } : {})
+            side,
+            order_type: 'market',
+            ...(Number.isFinite(sl) ? { stop_loss: sl } : {}),
+            ...(Number.isFinite(tp) ? { take_profit: tp } : {})
         };
         const headers = createExnessAuthHeaders(EXNESS_API_KEY, EXNESS_SECRET_KEY, 'POST', orderPath, body);
 
@@ -352,15 +397,20 @@ app.post('/api/exness/trade', async (req, res) => {
             timeout: 10000
         });
 
+        const synced = await fetchExnessAccountAndTrades(accountId);
+
         res.json({
             success: true,
-            message: 'Order executed via Exness Trader API.',
-            order: orderRes.data
+            message: `Market ${side.toUpperCase()} order for ${volume} ${symbol} submitted to Exness.`,
+            order: orderRes.data,
+            accounts: [synced.account],
+            trades: synced.trades
         });
     } catch (error) {
-        res.status(error.response?.status || 500).json({
+        const statusCode = error.response?.status || 500;
+        res.status(statusCode).json({
             success: false,
-            message: error.response?.data?.message || 'Trade execution failed.'
+            message: error.response?.data?.message || 'Market trade execution failed via Exness.'
         });
     }
 });
