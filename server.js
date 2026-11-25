@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * L3 MARKETS - Exness Backend Engine
- * Sign In with Email/Password • Live Account Balance & Trading Data • Trade Execution
+ * Sign In with Email/Password • Exness Account, Trades, Quotes & Candlesticks
  * Credentials & Base URLs loaded strictly from .env
  * ============================================================================
  */
@@ -78,6 +78,15 @@ function createExnessAuthHeaders(apiKey, secretKey, method = 'POST', pathAndQuer
     };
 }
 
+async function signedExnessGet(baseUrl, pathAndQuery) {
+    const headers = createExnessAuthHeaders(EXNESS_API_KEY, EXNESS_SECRET_KEY, 'GET', pathAndQuery);
+    return axios.get(`${baseUrl}${pathAndQuery}`, {
+        headers,
+        maxRedirects: 0,
+        timeout: 10000
+    });
+}
+
 async function resolveAccessPoint(accountId, apiKey = EXNESS_API_KEY, secretKey = EXNESS_SECRET_KEY) {
     const pathAndQuery = `/v1/trading/access-point?account_id=${encodeURIComponent(accountId)}`;
     const headers = createExnessAuthHeaders(apiKey, secretKey, 'GET', pathAndQuery);
@@ -106,6 +115,75 @@ async function resolveAccessPoint(accountId, apiKey = EXNESS_API_KEY, secretKey 
     throw lastError || new Error('Unable to resolve Exness access point.');
 }
 
+function normalizeCandles(rawPayload) {
+    const list = Array.isArray(rawPayload)
+        ? rawPayload
+        : rawPayload?.candles || rawPayload?.bars || rawPayload?.ohlc || rawPayload?.items || rawPayload?.data || [];
+
+    if (!Array.isArray(list)) return [];
+
+    return list
+        .map((c) => {
+            const rawTime = c.x ?? c.time ?? c.timestamp ?? c.t ?? c.open_time ?? c.date;
+            const ts = typeof rawTime === 'number'
+                ? (rawTime < 1e12 ? rawTime * 1000 : rawTime)
+                : Date.parse(rawTime);
+
+            const o = Number(c.o ?? c.open);
+            const h = Number(c.h ?? c.high);
+            const l = Number(c.l ?? c.low);
+            const closeVal = Number(c.c ?? c.close);
+
+            if (!Number.isFinite(ts) || !Number.isFinite(o) || !Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(closeVal)) {
+                return null;
+            }
+
+            return { x: ts, o, h, l, c: closeVal };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.x - b.x);
+}
+
+async function fetchExnessCandles(symbol, timeframe = '1m', limit = 100, accountId = DEFAULT_ACCOUNT_ID) {
+    if (!EXNESS_API_KEY || !EXNESS_SECRET_KEY) {
+        return { candles: [], source: 'missing_credentials' };
+    }
+
+    const cleanSymbol = String(symbol || 'EURUSD').trim().toUpperCase();
+    const cleanTf = String(timeframe || '1m').trim();
+    const cleanLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 1000);
+
+    let host = resolvedAccessPointUrl || BASE_URL;
+    if (accountId) {
+        try {
+            const disc = await resolveAccessPoint(accountId);
+            host = disc.accessPoint;
+        } catch (_) {}
+    }
+
+    const candidatePaths = [
+        `/v1/trading/candles?symbol=${encodeURIComponent(cleanSymbol)}&timeframe=${encodeURIComponent(cleanTf)}&limit=${cleanLimit}${accountId ? `&account_id=${encodeURIComponent(accountId)}` : ''}`,
+        `/v1/trading/instruments/${encodeURIComponent(cleanSymbol)}/candles?timeframe=${encodeURIComponent(cleanTf)}&limit=${cleanLimit}${accountId ? `&account_id=${encodeURIComponent(accountId)}` : ''}`,
+        `/v1/trading/market-data/candles?symbol=${encodeURIComponent(cleanSymbol)}&resolution=${encodeURIComponent(cleanTf)}&limit=${cleanLimit}`
+    ];
+
+    const hostsToTry = [...new Set([host, BASE_URL, ALT_BASE_URL].filter(Boolean))];
+
+    for (const targetHost of hostsToTry) {
+        for (const pathAndQuery of candidatePaths) {
+            try {
+                const res = await signedExnessGet(targetHost, pathAndQuery);
+                const candles = normalizeCandles(res.data);
+                if (candles.length > 0) {
+                    return { candles, source: 'exness', hostUsed: targetHost };
+                }
+            } catch (_) {}
+        }
+    }
+
+    return { candles: [], source: 'exness_empty_or_unsupported_endpoint' };
+}
+
 async function fetchExnessAccountAndTrades(accountId, fallbackLabel = 'Exness Account') {
     let accountRecord = {
         login: accountId || fallbackLabel,
@@ -115,7 +193,7 @@ async function fetchExnessAccountAndTrades(accountId, fallbackLabel = 'Exness Ac
         equity: 0,
         margin: 0,
         freeMargin: 0,
-        status: accountId ? 'Pending Gateway Sync' : 'Set EXNESS_ACCOUNT_ID in .env'
+        status: accountId ? 'Pending Exness Sync' : 'Set EXNESS_ACCOUNT_ID in .env'
     };
 
     let trades = [];
@@ -130,12 +208,7 @@ async function fetchExnessAccountAndTrades(accountId, fallbackLabel = 'Exness Ac
         accessPoint = discovery.accessPoint;
 
         const accountPath = `/v1/trading/accounts/${encodeURIComponent(accountId)}`;
-        const accHeaders = createExnessAuthHeaders(EXNESS_API_KEY, EXNESS_SECRET_KEY, 'GET', accountPath);
-        const accRes = await axios.get(`${accessPoint}${accountPath}`, {
-            headers: accHeaders,
-            maxRedirects: 0,
-            timeout: 10000
-        });
+        const accRes = await signedExnessGet(accessPoint, accountPath);
 
         const d = accRes.data?.data || accRes.data || {};
         const bal = Number(d.balance ?? 0);
@@ -153,17 +226,12 @@ async function fetchExnessAccountAndTrades(accountId, fallbackLabel = 'Exness Ac
         };
     } catch (err) {
         console.warn('[L3 Markets Account Fetch]:', err.response?.status, err.response?.data || err.message);
-        accountRecord.status = `Gateway Notice (${err.response?.status || 'Offline'})`;
+        accountRecord.status = `Gateway Notice (${err.response?.status || 'Unreachable'})`;
     }
 
     try {
         const positionsPath = `/v1/trading/accounts/${encodeURIComponent(accountId)}/positions`;
-        const posHeaders = createExnessAuthHeaders(EXNESS_API_KEY, EXNESS_SECRET_KEY, 'GET', positionsPath);
-        const posRes = await axios.get(`${accessPoint}${positionsPath}`, {
-            headers: posHeaders,
-            maxRedirects: 0,
-            timeout: 10000
-        });
+        const posRes = await signedExnessGet(accessPoint, positionsPath);
 
         const rawList = Array.isArray(posRes.data)
             ? posRes.data
@@ -245,9 +313,6 @@ app.get('/api/exness/access-point', async (req, res) => {
     }
 });
 
-/**
- * Client Sign In with Exness Email & Password + Load Account Balance & Trading Data
- */
 app.post('/api/exness/login', async (req, res) => {
     const email = String(req.body.email || '').trim();
     const password = String(req.body.password || '');
@@ -277,9 +342,6 @@ app.post('/api/exness/login', async (req, res) => {
     });
 });
 
-/**
- * Refresh Session, Account Balance & Open Trading Data
- */
 app.post('/api/exness/refresh-session', async (req, res) => {
     const token = String(req.body.token || '').trim();
     const email = String(req.body.email || '').trim();
@@ -302,9 +364,23 @@ app.post('/api/exness/refresh-session', async (req, res) => {
     });
 });
 
-/**
- * Instruments Catalog
- */
+app.get('/api/exness/candles', async (req, res) => {
+    const symbol = String(req.query.symbol || 'EURUSD').trim().toUpperCase();
+    const timeframe = String(req.query.timeframe || '1m').trim();
+    const limit = parseInt(req.query.limit, 10) || 100;
+    const accountId = String(req.query.account_id || DEFAULT_ACCOUNT_ID || '').trim();
+
+    const result = await fetchExnessCandles(symbol, timeframe, limit, accountId);
+
+    res.json({
+        success: true,
+        symbol,
+        timeframe,
+        source: result.source,
+        candles: result.candles
+    });
+});
+
 app.post('/api/exness/instruments', async (req, res) => {
     const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
     const targetHost = resolvedAccessPointUrl || BASE_URL;
@@ -312,16 +388,15 @@ app.post('/api/exness/instruments', async (req, res) => {
     if (accountId && EXNESS_API_KEY && EXNESS_SECRET_KEY) {
         try {
             const pathAndQuery = `/v1/trading/instruments?account_id=${encodeURIComponent(accountId)}`;
-            const headers = createExnessAuthHeaders(EXNESS_API_KEY, EXNESS_SECRET_KEY, 'GET', pathAndQuery);
-            const response = await axios.get(`${targetHost}${pathAndQuery}`, {
-                headers,
-                maxRedirects: 0,
-                timeout: 10000
-            });
-            return res.json({
-                success: true,
-                instruments: response.data?.instruments || response.data
-            });
+            const response = await signedExnessGet(targetHost, pathAndQuery);
+            const raw = response.data?.instruments || response.data;
+            if (raw && (Array.isArray(raw) ? raw.length > 0 : Object.keys(raw).length > 0)) {
+                return res.json({
+                    success: true,
+                    source: 'exness',
+                    instruments: raw
+                });
+            }
         } catch (err) {
             console.warn('[L3 Markets Instruments]:', err.response?.status, err.response?.data || err.message);
         }
@@ -329,32 +404,11 @@ app.post('/api/exness/instruments', async (req, res) => {
 
     return res.json({
         success: true,
-        instruments: {
-            forex_majors: [
-                { symbol: 'EURUSD', name: 'Euro vs US Dollar', spread: 0.0001 },
-                { symbol: 'GBPUSD', name: 'British Pound vs US Dollar', spread: 0.00014 },
-                { symbol: 'USDJPY', name: 'US Dollar vs Japanese Yen', spread: 0.012 },
-                { symbol: 'AUDUSD', name: 'Australian Dollar vs US Dollar', spread: 0.00012 }
-            ],
-            precious_metals: [
-                { symbol: 'XAUUSD', name: 'Gold vs US Dollar', spread: 0.2 },
-                { symbol: 'XAGUSD', name: 'Silver vs US Dollar', spread: 0.025 }
-            ],
-            cryptocurrencies: [
-                { symbol: 'BTCUSD', name: 'Bitcoin vs US Dollar', spread: 12.0 },
-                { symbol: 'ETHUSD', name: 'Ethereum vs US Dollar', spread: 1.5 }
-            ],
-            stock_indices: [
-                { symbol: 'US30', name: 'Wall Street 30', spread: 2.2 },
-                { symbol: 'USTEC', name: 'US Tech 100', spread: 1.5 }
-            ]
-        }
+        source: 'none',
+        instruments: {}
     });
 });
 
-/**
- * Market Trade Execution (BUY / SELL) via Exness Trader API
- */
 app.post('/api/exness/trade', async (req, res) => {
     const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
     const symbol = String(req.body.symbol || '').trim().toUpperCase();
