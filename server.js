@@ -461,21 +461,30 @@ app.post('/api/exness/login', async (req, res) => {
     }
 
     const sessionToken = `l3_session_${crypto.randomBytes(16).toString('hex')}`;
-    const summary = await fetchExnessAccountSummary(accountId, email);
-    connectExnessStreams(accountId, subscribedTickSymbol);
 
-    res.json({
-        success: true,
-        platform: 'L3 Markets',
-        token: sessionToken,
-        user: email,
-        account_id: accountId || null,
-        discovery_base_url: DISCOVERY_BASE_URL,
-        access_point: summary.accessPoint,
-        notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.',
-        accounts: [summary.account],
-        recentEvents
-    });
+    try {
+        const summary = await fetchExnessAccountSummary(accountId, email);
+        connectExnessStreams(accountId, subscribedTickSymbol);
+
+        return res.json({
+            success: true,
+            platform: 'L3 Markets',
+            token: sessionToken,
+            user: email,
+            account_id: accountId || null,
+            discovery_base_url: DISCOVERY_BASE_URL,
+            access_point: summary.accessPoint,
+            notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.',
+            accounts: [summary.account],
+            recentEvents
+        });
+    } catch (error) {
+        console.error('[L3 Markets Login Error]:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: error.message || 'Failed to initialize Exness session.'
+        });
+    }
 });
 
 app.post('/api/exness/refresh-session', async (req, res) => {
@@ -487,18 +496,26 @@ app.post('/api/exness/refresh-session', async (req, res) => {
         return res.status(401).json({ success: false, message: 'Session token required.' });
     }
 
-    const summary = await fetchExnessAccountSummary(accountId, email || 'Exness Account');
-    connectExnessStreams(accountId, subscribedTickSymbol);
+    try {
+        const summary = await fetchExnessAccountSummary(accountId, email || 'Exness Account');
+        connectExnessStreams(accountId, subscribedTickSymbol);
 
-    res.json({
-        success: true,
-        user: email || null,
-        account_id: accountId || null,
-        discovery_base_url: DISCOVERY_BASE_URL,
-        access_point: summary.accessPoint,
-        accounts: [summary.account],
-        recentEvents
-    });
+        return res.json({
+            success: true,
+            user: email || null,
+            account_id: accountId || null,
+            discovery_base_url: DISCOVERY_BASE_URL,
+            access_point: summary.accessPoint,
+            accounts: [summary.account],
+            recentEvents
+        });
+    } catch (error) {
+        console.error('[L3 Markets Refresh Error]:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: error.message || 'Failed to refresh Exness session.'
+        });
+    }
 });
 
 app.get('/api/exness/candles', async (req, res) => {
