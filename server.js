@@ -133,8 +133,8 @@ function createSignedExnessHeaders(apiKey, rawPrivateKey, method = 'GET', pathAn
 
 async function resolveAccessPoint(accountId, forceRefresh = false) {
     const acct = String(accountId || '').trim();
-    if (!acct) {
-        throw new Error('account_id is required to resolve Exness Access Point.');
+    if (!/^\d+$/.test(acct)) {
+        throw new Error('A valid numeric account_id is required to resolve Exness Access Point.');
     }
 
     if (!forceRefresh && accessPointCache.has(acct)) {
@@ -247,8 +247,8 @@ function recordTickIntoCandles(symbol, bid, ask, tsMs = Date.now()) {
 }
 
 function connectExnessStreams(accountId, symbol = 'EURUSD') {
-    const acct = String(accountId || DEFAULT_ACCOUNT_ID || '').trim();
-    if (!acct || !EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW) return;
+    const acct = String(accountId || '').trim();
+    if (!/^\d+$/.test(acct) || !EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW) return;
 
     subscribedTickSymbol = String(symbol || 'EURUSD').toUpperCase();
 
@@ -332,20 +332,21 @@ function connectExnessStreams(accountId, symbol = 'EURUSD') {
         });
 }
 
-async function fetchExnessAccountSummary(accountId, fallbackLabel = 'Exness Account') {
+async function fetchExnessAccountSummary(accountId, fallbackLabel = '') {
     const acct = String(accountId || '').trim();
     const baseRecord = {
-        login: acct || fallbackLabel,
+        login: acct,
+        label: fallbackLabel || acct,
         accountType: 'Exness Trader API',
         currency: 'USD',
         balance: 0,
         equity: 0,
         leverage: '',
-        status: acct ? 'Pending Discovery' : 'Set EXNESS_ACCOUNT_ID in .env'
+        status: 'Pending Discovery'
     };
 
-    if (!acct || !EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW) {
-        return { account: baseRecord, accessPoint: null, rawConfig: null };
+    if (!/^\d+$/.test(acct) || !EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW) {
+        return { account: { ...baseRecord, status: 'Missing API Credentials or Account ID' }, accessPoint: null, rawConfig: null };
     }
 
     try {
@@ -357,6 +358,7 @@ async function fetchExnessAccountSummary(accountId, fallbackLabel = 'Exness Acco
         return {
             account: {
                 login: String(cfg.account_id ?? acct),
+                label: fallbackLabel || String(cfg.account_id ?? acct),
                 accountType: cfg.account_type || cfg.type || 'Exness Trader API',
                 currency: cfg.currency || 'USD',
                 balance: Number(cfg.balance ?? 0),
@@ -406,7 +408,7 @@ app.get('/health', async (req, res) => {
     const accountId = String(req.query.account_id || DEFAULT_ACCOUNT_ID || '').trim();
     let accessPoint = accessPointCache.get(accountId)?.accessPoint || null;
 
-    if (!accessPoint && accountId && EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW) {
+    if (!accessPoint && /^\d+$/.test(accountId) && EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW) {
         try {
             const disc = await resolveAccessPoint(accountId);
             accessPoint = disc.accessPoint;
@@ -419,7 +421,7 @@ app.get('/health', async (req, res) => {
         broker: 'Exness',
         discoveryBaseUrl: DISCOVERY_BASE_URL,
         accessPoint,
-        accountConfigured: Boolean(accountId),
+        accountConfigured: /^\d+$/.test(accountId),
         credentialsLoadedFromEnv: Boolean(EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW),
         notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.',
         timestamp: new Date().toISOString()
@@ -427,51 +429,54 @@ app.get('/health', async (req, res) => {
 });
 
 app.get('/api/exness/access-point', async (req, res) => {
-    const accountId = String(req.query.account_id || DEFAULT_ACCOUNT_ID || '').trim();
-    if (!accountId) {
-        return res.status(400).json({ success: false, message: 'account_id query parameter is required.' });
+    const accountId = String(req.query.account_id || '').trim();
+    if (!/^\d+$/.test(accountId)) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid numeric account_id query parameter is required.'
+        });
     }
 
     try {
         const discovery = await resolveAccessPoint(accountId, Boolean(req.query.refresh));
-        res.json({
+        return res.json({
             success: true,
             account_id: discovery.accountId,
             access_point: discovery.accessPoint,
             discovery_host: discovery.discoveryHost
         });
     } catch (error) {
-        res.status(error.response?.status || 500).json({
+        return res.status(error.response?.status || 500).json({
             success: false,
+            message: error.response?.data?.message || error.message,
             error: error.response?.data || { message: error.message }
         });
     }
 });
 
 app.post('/api/exness/login', async (req, res) => {
-    const email = String(req.body.email || '').trim();
-    const password = String(req.body.password || '');
-    const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
+    const accountId = String(req.body.accountId || req.body.account_id || '').trim();
+    const label = String(req.body.label || req.body.email || '').trim();
 
-    if (!email || !password) {
+    if (!/^\d+$/.test(accountId)) {
         return res.status(400).json({
             success: false,
-            message: 'Email address and password are required.'
+            message: 'A valid Exness Account ID (numeric string) is required to sign in.'
         });
     }
 
     const sessionToken = `l3_session_${crypto.randomBytes(16).toString('hex')}`;
 
     try {
-        const summary = await fetchExnessAccountSummary(accountId, email);
+        const summary = await fetchExnessAccountSummary(accountId, label || accountId);
         connectExnessStreams(accountId, subscribedTickSymbol);
 
         return res.json({
             success: true,
             platform: 'L3 Markets',
             token: sessionToken,
-            user: email,
-            account_id: accountId || null,
+            user: label || accountId,
+            account_id: accountId,
             discovery_base_url: DISCOVERY_BASE_URL,
             access_point: summary.accessPoint,
             notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.',
@@ -489,21 +494,24 @@ app.post('/api/exness/login', async (req, res) => {
 
 app.post('/api/exness/refresh-session', async (req, res) => {
     const token = String(req.body.token || '').trim();
-    const email = String(req.body.email || '').trim();
-    const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
+    const accountId = String(req.body.accountId || req.body.account_id || '').trim();
+    const label = String(req.body.label || req.body.email || '').trim();
 
     if (!token) {
         return res.status(401).json({ success: false, message: 'Session token required.' });
     }
+    if (!/^\d+$/.test(accountId)) {
+        return res.status(400).json({ success: false, message: 'Valid numeric accountId is required.' });
+    }
 
     try {
-        const summary = await fetchExnessAccountSummary(accountId, email || 'Exness Account');
+        const summary = await fetchExnessAccountSummary(accountId, label || accountId);
         connectExnessStreams(accountId, subscribedTickSymbol);
 
         return res.json({
             success: true,
-            user: email || null,
-            account_id: accountId || null,
+            user: label || accountId,
+            account_id: accountId,
             discovery_base_url: DISCOVERY_BASE_URL,
             access_point: summary.accessPoint,
             accounts: [summary.account],
@@ -522,14 +530,16 @@ app.get('/api/exness/candles', async (req, res) => {
     const symbol = String(req.query.symbol || 'EURUSD').trim().toUpperCase();
     const timeframe = String(req.query.timeframe || '1m').trim();
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 300);
-    const accountId = String(req.query.account_id || DEFAULT_ACCOUNT_ID || '').trim();
+    const accountId = String(req.query.account_id || '').trim();
 
-    connectExnessStreams(accountId, symbol);
+    if (/^\d+$/.test(accountId)) {
+        connectExnessStreams(accountId, symbol);
+    }
 
     const series = candleSeries.get(`${symbol}:${timeframe}`) || [];
     const candles = series.slice(-limit);
 
-    res.json({
+    return res.json({
         success: true,
         symbol,
         timeframe,
@@ -540,9 +550,9 @@ app.get('/api/exness/candles', async (req, res) => {
 });
 
 app.post('/api/exness/instruments', async (req, res) => {
-    const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
+    const accountId = String(req.body.accountId || req.body.account_id || '').trim();
 
-    if (accountId && EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW) {
+    if (/^\d+$/.test(accountId) && EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW) {
         try {
             const discovery = await resolveAccessPoint(accountId);
             const pathAndQuery = `/v1/trading/accounts/${encodeURIComponent(accountId)}/instruments`;
@@ -571,15 +581,15 @@ app.post('/api/exness/instruments', async (req, res) => {
 });
 
 app.post('/api/exness/trade', async (req, res) => {
-    const accountId = String(req.body.accountId || req.body.account_id || DEFAULT_ACCOUNT_ID || '').trim();
+    const accountId = String(req.body.accountId || req.body.account_id || '').trim();
     const instrument = String(req.body.symbol || req.body.instrument || '').trim().toUpperCase();
     const volume = String(req.body.volume ?? '').trim();
     const side = String(req.body.side || req.body.orderType || '').trim().toLowerCase();
 
-    if (!accountId) {
+    if (!/^\d+$/.test(accountId)) {
         return res.status(400).json({
             success: false,
-            message: 'EXNESS_ACCOUNT_ID must be configured in .env for Trader API position requests.'
+            message: 'A valid numeric accountId is required for Trader API position requests.'
         });
     }
 
@@ -603,7 +613,7 @@ app.post('/api/exness/trade', async (req, res) => {
         const ack = orderRes.data || {};
         const summary = await fetchExnessAccountSummary(accountId);
 
-        res.json({
+        return res.json({
             success: true,
             message: 'Position request accepted by Exness (asynchronous ACK).',
             operation_id: ack.operation_id || null,
@@ -615,7 +625,7 @@ app.post('/api/exness/trade', async (req, res) => {
         });
     } catch (error) {
         const statusCode = error.response?.status || 500;
-        res.status(statusCode).json({
+        return res.status(statusCode).json({
             success: false,
             message: error.response?.data?.message || error.message || 'Trade request failed via Exness.'
         });
