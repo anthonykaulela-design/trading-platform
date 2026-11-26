@@ -335,7 +335,7 @@ function recordExnessTick(symbol, bid, ask, tsMs = Date.now()) {
 function scheduleTicksReconnect() {
     if (ticksReconnectTimer) return;
     if (!/^\d+$/.test(activeStreamAccountId) || !subscribedTickSymbol) return;
-    const delayMs = Math.min(1000 * (2 ** ticksReconnectAttempts), 30000);
+    const delayMs = Math.min(1000 * (2 ** ticksReconnectAttempts), 60000);
     ticksReconnectAttempts += 1;
     ticksReconnectTimer = setTimeout(() => {
         ticksReconnectTimer = null;
@@ -346,12 +346,29 @@ function scheduleTicksReconnect() {
 function scheduleEventsReconnect() {
     if (eventsReconnectTimer) return;
     if (!/^\d+$/.test(activeStreamAccountId)) return;
-    const delayMs = Math.min(1000 * (2 ** eventsReconnectAttempts), 30000);
+    const delayMs = Math.min(1000 * (2 ** eventsReconnectAttempts), 60000);
     eventsReconnectAttempts += 1;
     eventsReconnectTimer = setTimeout(() => {
         eventsReconnectTimer = null;
         openEventsSocket(activeStreamAccountId);
     }, delayMs);
+}
+
+function attachWsDiagnostics(ws, label, onAuthOrForbidden) {
+    ws.on('unexpected-response', (req, res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+            const bodyText = Buffer.concat(chunks).toString('utf8').slice(0, 300);
+            console.warn(
+                `[L3 Markets ${label} WS Unexpected ${res.statusCode}]:`,
+                bodyText || '(empty body)'
+            );
+            if (res.statusCode === 401 || res.statusCode === 403) {
+                onAuthOrForbidden?.(res.statusCode);
+            }
+        });
+    });
 }
 
 function openTicksSocket(acct, symbol) {
@@ -376,8 +393,14 @@ function openTicksSocket(acct, symbol) {
             const wsOrigin = accessPoint.replace(/^http(s?):\/\//i, (_, s) => (s ? 'wss://' : 'ws://'));
             const ticksPath = `/v1/server-events/accounts/${encodeURIComponent(acct)}/ws/ticks`;
             const tickHeaders = createSignedExnessHeaders(EXNESS_API_KEY, EXNESS_PRIVATE_KEY_RAW, 'GET', ticksPath, '');
-            const ws = new WebSocket(`${wsOrigin}${ticksPath}`, ['json'], { headers: tickHeaders });
+            const ws = new WebSocket(`${wsOrigin}${ticksPath}`, { headers: tickHeaders });
             upstreamTicksWs = ws;
+
+            attachWsDiagnostics(ws, 'Ticks', (code) => {
+                if (code === 401 || code === 403) {
+                    ticksReconnectAttempts = Math.max(ticksReconnectAttempts, 4);
+                }
+            });
 
             ws.on('open', () => {
                 ticksReconnectAttempts = 0;
@@ -440,8 +463,14 @@ function openEventsSocket(acct) {
             const wsOrigin = accessPoint.replace(/^http(s?):\/\//i, (_, s) => (s ? 'wss://' : 'ws://'));
             const eventsPath = `/v1/server-events/accounts/${encodeURIComponent(acct)}/ws/events`;
             const evtHeaders = createSignedExnessHeaders(EXNESS_API_KEY, EXNESS_PRIVATE_KEY_RAW, 'GET', eventsPath, '');
-            const ws = new WebSocket(`${wsOrigin}${eventsPath}`, ['json'], { headers: evtHeaders });
+            const ws = new WebSocket(`${wsOrigin}${eventsPath}`, { headers: evtHeaders });
             upstreamEventsWs = ws;
+
+            attachWsDiagnostics(ws, 'Events', (code) => {
+                if (code === 401 || code === 403) {
+                    eventsReconnectAttempts = Math.max(eventsReconnectAttempts, 4);
+                }
+            });
 
             ws.on('open', () => {
                 eventsReconnectAttempts = 0;
