@@ -376,7 +376,7 @@ function openTicksSocket(acct, symbol) {
             const wsOrigin = accessPoint.replace(/^http(s?):\/\//i, (_, s) => (s ? 'wss://' : 'ws://'));
             const ticksPath = `/v1/server-events/accounts/${encodeURIComponent(acct)}/ws/ticks`;
             const tickHeaders = createSignedExnessHeaders(EXNESS_API_KEY, EXNESS_PRIVATE_KEY_RAW, 'GET', ticksPath, '');
-            const ws = new WebSocket(`${wsOrigin}${ticksPath}`, { headers: tickHeaders });
+            const ws = new WebSocket(`${wsOrigin}${ticksPath}`, ['json'], { headers: tickHeaders });
             upstreamTicksWs = ws;
 
             ws.on('open', () => {
@@ -440,7 +440,7 @@ function openEventsSocket(acct) {
             const wsOrigin = accessPoint.replace(/^http(s?):\/\//i, (_, s) => (s ? 'wss://' : 'ws://'));
             const eventsPath = `/v1/server-events/accounts/${encodeURIComponent(acct)}/ws/events`;
             const evtHeaders = createSignedExnessHeaders(EXNESS_API_KEY, EXNESS_PRIVATE_KEY_RAW, 'GET', eventsPath, '');
-            const ws = new WebSocket(`${wsOrigin}${eventsPath}`, { headers: evtHeaders });
+            const ws = new WebSocket(`${wsOrigin}${eventsPath}`, ['json'], { headers: evtHeaders });
             upstreamEventsWs = ws;
 
             ws.on('open', () => {
@@ -850,18 +850,42 @@ app.post('/api/exness/instruments', requireValidSession, async (req, res) => {
         });
     }
 
+    const candidatePaths = [
+        `/v1/configuration/accounts/${encodeURIComponent(accountId)}/instruments`,
+        `/v1/trading/accounts/${encodeURIComponent(accountId)}/instruments`
+    ];
+
     try {
         const discovery = await resolveAccessPoint(accountId);
-        const pathAndQuery = `/v1/trading/accounts/${encodeURIComponent(accountId)}/instruments`;
-        const response = await signedRestRequest(discovery.accessPoint, 'GET', pathAndQuery);
-        const list = Array.isArray(response.data)
-            ? response.data
-            : response.data?.instruments || response.data?.items || response.data?.data || [];
+        let list = null;
+        let lastErr = null;
 
-        if (!Array.isArray(list)) {
-            return res.status(502).json({
-                success: false,
-                message: 'Unexpected instruments payload format from Exness.'
+        for (const pathAndQuery of candidatePaths) {
+            try {
+                const response = await signedRestRequest(discovery.accessPoint, 'GET', pathAndQuery);
+                const parsed = Array.isArray(response.data)
+                    ? response.data
+                    : response.data?.instruments || response.data?.items || response.data?.data || [];
+                if (Array.isArray(parsed)) {
+                    list = parsed;
+                    break;
+                }
+            } catch (err) {
+                lastErr = err;
+                if (err.response?.status !== 404) {
+                    throw err;
+                }
+            }
+        }
+
+        if (!list) {
+            return res.json({
+                success: true,
+                source: 'exness',
+                instruments: { exness_instruments: exnessInstrumentsCache.get(accountId) || [] },
+                message: lastErr?.response?.status === 404
+                    ? 'Instruments REST endpoint not exposed on this Access Point; stream or enter an Exness instrument symbol directly.'
+                    : 'No instruments returned by Exness.'
             });
         }
 
