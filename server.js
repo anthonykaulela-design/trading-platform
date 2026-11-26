@@ -1,8 +1,8 @@
 /**
  * ============================================================================
- * L3 MARKETS - Exness API Backend Engine (Document1.pdf Specification)
- * Ed25519 Signing • Access Point Discovery • Account & Positions • Live WS Ticks
- * Credentials & Base URLs loaded strictly from .env
+ * L3 MARKETS - Exness API Backend Engine
+ * Ed25519 Signing • Key Management Gateway • Account & Positions • Live WS Ticks
+ * Credentials & Gateway URL loaded strictly from .env
  * ============================================================================
  */
 
@@ -23,20 +23,34 @@ const EXNESS_PRIVATE_KEY_RAW = (
 ).trim();
 const DEFAULT_ACCOUNT_ID = (process.env.EXNESS_ACCOUNT_ID || '').trim();
 
-const BASE_URL = (process.env.EXNESS_BASE_URL || 'https://api.exness.com').replace(/\/+$/, '');
-const DISCOVERY_BASE_URL = (process.env.EXNESS_DISCOVERY_BASE_URL || BASE_URL).replace(/\/+$/, '');
-const ALT_BASE_URL = (process.env.EXNESS_ALT_BASE_URL || '').replace(/\/+$/, '');
+const GATEWAY_URL = (
+    process.env.EXNESS_GATEWAY_URL ||
+    process.env.EXNESS_DISCOVERY_BASE_URL ||
+    process.env.EXNESS_BASE_URL ||
+    ''
+).trim().replace(/\/+$/, '');
+const ALT_GATEWAY_URL = (process.env.EXNESS_ALT_GATEWAY_URL || process.env.EXNESS_ALT_BASE_URL || '')
+    .trim()
+    .replace(/\/+$/, '');
 
 const EMPTY_BODY_HASH = '47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU';
+const VALID_TIMEFRAMES = new Set(['1m', '5m', '15m', '1h']);
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 const accessPointCache = new Map();
 const latestTicks = new Map();
 const candleSeries = new Map();
+const activeSessions = new Map();
 const recentEvents = [];
 
 let upstreamTicksWs = null;
 let upstreamEventsWs = null;
 let subscribedTickSymbol = 'EURUSD';
+let activeStreamAccountId = '';
+let ticksReconnectTimer = null;
+let eventsReconnectTimer = null;
+let ticksReconnectAttempts = 0;
+let eventsReconnectAttempts = 0;
 
 const app = express();
 const server = http.createServer(app);
@@ -44,6 +58,68 @@ const server = http.createServer(app);
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+function hasValidGatewayUrl() {
+    if (!GATEWAY_URL) return false;
+    try {
+        const parsed = new URL(GATEWAY_URL);
+        return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+    } catch (_) {
+        return false;
+    }
+}
+
+function getGatewayHosts() {
+    const hosts = [GATEWAY_URL, ALT_GATEWAY_URL].filter(Boolean);
+    return [...new Set(hosts)];
+}
+
+function issueSessionToken(accountId, label) {
+    const token = `l3_session_${crypto.randomBytes(24).toString('hex')}`;
+    const now = Date.now();
+    activeSessions.set(token, {
+        token,
+        accountId,
+        label: label || accountId,
+        createdAt: now,
+        expiresAt: now + SESSION_TTL_MS
+    });
+    return token;
+}
+
+function validateSessionToken(rawToken) {
+    const token = String(rawToken || '').trim();
+    if (!token) return null;
+    const session = activeSessions.get(token);
+    if (!session) return null;
+    if (Date.now() > session.expiresAt) {
+        activeSessions.delete(token);
+        return null;
+    }
+    session.expiresAt = Date.now() + SESSION_TTL_MS;
+    return session;
+}
+
+function extractTokenFromReq(req) {
+    const authHeader = String(req.headers.authorization || '').trim();
+    if (authHeader.toLowerCase().startsWith('bearer ')) {
+        return authHeader.slice(7).trim();
+    }
+    return String(req.body?.token || req.query?.token || '').trim();
+}
+
+function requireValidSession(req, res, next) {
+    const token = extractTokenFromReq(req);
+    const session = validateSessionToken(token);
+    if (!session) {
+        return res.status(401).json({
+            success: false,
+            message: 'Invalid or expired session token. Please sign in again.'
+        });
+    }
+    req.session = session;
+    return next();
+}
 
 function toBase64Url(bufOrStr) {
     const buf = Buffer.isBuffer(bufOrStr) ? bufOrStr : Buffer.from(bufOrStr, 'utf8');
@@ -94,6 +170,9 @@ function loadEd25519PrivateKey(rawKey) {
 }
 
 function createSignedExnessHeaders(apiKey, rawPrivateKey, method = 'GET', pathAndQuery = '', rawBodyStr = '') {
+    if (!apiKey) {
+        throw new Error('EXNESS_API_KEY is not configured in .env.');
+    }
     const privateKeyObj = loadEd25519PrivateKey(rawPrivateKey);
     const upperMethod = String(method || 'GET').toUpperCase();
     const isGet = upperMethod === 'GET';
@@ -136,13 +215,16 @@ async function resolveAccessPoint(accountId, forceRefresh = false) {
     if (!/^\d+$/.test(acct)) {
         throw new Error('A valid numeric account_id is required to resolve Exness Access Point.');
     }
+    if (!hasValidGatewayUrl()) {
+        throw new Error('EXNESS_GATEWAY_URL is not configured in .env. Set the Gateway URL from Exness Key Management.');
+    }
 
     if (!forceRefresh && accessPointCache.has(acct)) {
         return accessPointCache.get(acct);
     }
 
     const pathAndQuery = `/v1/trading/access-point?account_id=${encodeURIComponent(acct)}`;
-    const hosts = [...new Set([DISCOVERY_BASE_URL, BASE_URL, ALT_BASE_URL].filter(Boolean))];
+    const hosts = getGatewayHosts();
 
     let lastError = null;
     for (const host of hosts) {
@@ -168,6 +250,7 @@ async function resolveAccessPoint(accountId, forceRefresh = false) {
                 accessPointCache.set(acct, entry);
                 return entry;
             }
+            lastError = new Error(`Gateway ${host} returned no access_point.`);
         } catch (err) {
             lastError = err;
         }
@@ -208,7 +291,7 @@ function timeframeToMs(tf) {
         '15m': 15 * 60 * 1000,
         '1h': 60 * 60 * 1000
     };
-    return map[tf] || 60 * 1000;
+    return map[tf];
 }
 
 function recordTickIntoCandles(symbol, bid, ask, tsMs = Date.now()) {
@@ -227,7 +310,7 @@ function recordTickIntoCandles(symbol, bid, ask, tsMs = Date.now()) {
         timestamp: tsMs
     });
 
-    for (const tf of ['1m', '5m', '15m', '1h']) {
+    for (const tf of VALID_TIMEFRAMES) {
         const key = `${sym}:${tf}`;
         const bucketMs = timeframeToMs(tf);
         const bucketStart = Math.floor(tsMs / bucketMs) * bucketMs;
@@ -246,90 +329,176 @@ function recordTickIntoCandles(symbol, bid, ask, tsMs = Date.now()) {
     }
 }
 
-function connectExnessStreams(accountId, symbol = 'EURUSD') {
-    const acct = String(accountId || '').trim();
-    if (!/^\d+$/.test(acct) || !EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW) return;
+function scheduleTicksReconnect() {
+    if (ticksReconnectTimer) return;
+    if (!/^\d+$/.test(activeStreamAccountId)) return;
+    const delayMs = Math.min(1000 * (2 ** ticksReconnectAttempts), 30000);
+    ticksReconnectAttempts += 1;
+    ticksReconnectTimer = setTimeout(() => {
+        ticksReconnectTimer = null;
+        openTicksSocket(activeStreamAccountId, subscribedTickSymbol);
+    }, delayMs);
+}
 
-    subscribedTickSymbol = String(symbol || 'EURUSD').toUpperCase();
+function scheduleEventsReconnect() {
+    if (eventsReconnectTimer) return;
+    if (!/^\d+$/.test(activeStreamAccountId)) return;
+    const delayMs = Math.min(1000 * (2 ** eventsReconnectAttempts), 30000);
+    eventsReconnectAttempts += 1;
+    eventsReconnectTimer = setTimeout(() => {
+        eventsReconnectTimer = null;
+        openEventsSocket(activeStreamAccountId);
+    }, delayMs);
+}
+
+function openTicksSocket(acct, symbol) {
+    if (upstreamTicksWs && (upstreamTicksWs.readyState === WebSocket.OPEN || upstreamTicksWs.readyState === WebSocket.CONNECTING)) {
+        if (upstreamTicksWs.readyState === WebSocket.OPEN) {
+            upstreamTicksWs.send(JSON.stringify({
+                id: `ticks-${symbol.toLowerCase()}-${Date.now()}`,
+                subscribe: {
+                    event: 'ticks',
+                    instruments: [symbol]
+                }
+            }));
+        }
+        return;
+    }
 
     resolveAccessPoint(acct)
         .then(({ accessPoint }) => {
             const wsOrigin = accessPoint.replace(/^http(s?):\/\//i, (_, s) => (s ? 'wss://' : 'ws://'));
-
             const ticksPath = `/v1/server-events/accounts/${encodeURIComponent(acct)}/ws/ticks`;
-            if (!upstreamTicksWs || upstreamTicksWs.readyState === WebSocket.CLOSED) {
-                const tickHeaders = createSignedExnessHeaders(EXNESS_API_KEY, EXNESS_PRIVATE_KEY_RAW, 'GET', ticksPath, '');
-                upstreamTicksWs = new WebSocket(`${wsOrigin}${ticksPath}`, { headers: tickHeaders });
+            const tickHeaders = createSignedExnessHeaders(EXNESS_API_KEY, EXNESS_PRIVATE_KEY_RAW, 'GET', ticksPath, '');
+            const ws = new WebSocket(`${wsOrigin}${ticksPath}`, { headers: tickHeaders });
+            upstreamTicksWs = ws;
 
-                upstreamTicksWs.on('open', () => {
-                    upstreamTicksWs.send(JSON.stringify({
-                        id: `ticks-${subscribedTickSymbol.toLowerCase()}-1`,
-                        subscribe: {
-                            event: 'ticks',
-                            instruments: [subscribedTickSymbol]
-                        }
-                    }));
-                });
-
-                upstreamTicksWs.on('message', (raw) => {
-                    try {
-                        const msg = JSON.parse(raw.toString());
-                        const payload = msg.data || msg.tick || msg;
-                        const sym = String(payload.instrument || payload.symbol || subscribedTickSymbol).toUpperCase();
-                        const bid = Number(payload.bid ?? payload.b ?? payload.price);
-                        const ask = Number(payload.ask ?? payload.a ?? bid);
-                        const ts = Number(payload.timestamp || payload.t || Date.now());
-                        recordTickIntoCandles(sym, bid, ask, ts < 1e12 ? ts * 1000 : ts);
-                        broadcastToClients({ type: 'TICK', symbol: sym, bid, ask, timestamp: ts });
-                    } catch (_) {}
-                });
-
-                upstreamTicksWs.on('close', () => {
-                    upstreamTicksWs = null;
-                });
-            } else if (upstreamTicksWs.readyState === WebSocket.OPEN) {
-                upstreamTicksWs.send(JSON.stringify({
-                    id: `ticks-${subscribedTickSymbol.toLowerCase()}-sub`,
+            ws.on('open', () => {
+                ticksReconnectAttempts = 0;
+                ws.send(JSON.stringify({
+                    id: `ticks-${symbol.toLowerCase()}-1`,
                     subscribe: {
                         event: 'ticks',
                         instruments: [subscribedTickSymbol]
                     }
                 }));
-            }
+            });
 
-            const eventsPath = `/v1/server-events/accounts/${encodeURIComponent(acct)}/ws/events`;
-            if (!upstreamEventsWs || upstreamEventsWs.readyState === WebSocket.CLOSED) {
-                const evtHeaders = createSignedExnessHeaders(EXNESS_API_KEY, EXNESS_PRIVATE_KEY_RAW, 'GET', eventsPath, '');
-                upstreamEventsWs = new WebSocket(`${wsOrigin}${eventsPath}`, { headers: evtHeaders });
+            ws.on('message', (raw) => {
+                try {
+                    const msg = JSON.parse(raw.toString());
+                    const payload = msg.data || msg.tick || msg;
+                    const sym = String(payload.instrument || payload.symbol || subscribedTickSymbol).toUpperCase();
+                    const bid = Number(payload.bid ?? payload.b ?? payload.price);
+                    const ask = Number(payload.ask ?? payload.a ?? bid);
+                    const ts = Number(payload.timestamp || payload.t || Date.now());
+                    recordTickIntoCandles(sym, bid, ask, ts < 1e12 ? ts * 1000 : ts);
+                    broadcastToClients({ type: 'TICK', symbol: sym, bid, ask, timestamp: ts });
+                } catch (err) {
+                    console.warn('[L3 Markets Ticks Parse]:', err.message);
+                }
+            });
 
-                upstreamEventsWs.on('open', () => {
-                    upstreamEventsWs.send(JSON.stringify({
-                        id: 'subscribe-transactions-1',
-                        subscribe: { event: 'transactions' }
-                    }));
-                    upstreamEventsWs.send(JSON.stringify({
-                        id: 'subscribe-account-1',
-                        subscribe: { event: 'account' }
-                    }));
-                });
+            ws.on('error', (err) => {
+                console.warn('[L3 Markets Ticks WS Error]:', err.message);
+            });
 
-                upstreamEventsWs.on('message', (raw) => {
-                    try {
-                        const evt = JSON.parse(raw.toString());
-                        recentEvents.unshift({ receivedAt: new Date().toISOString(), event: evt });
-                        if (recentEvents.length > 100) recentEvents.pop();
-                        broadcastToClients({ type: 'EXNESS_EVENT', event: evt });
-                    } catch (_) {}
-                });
-
-                upstreamEventsWs.on('close', () => {
-                    upstreamEventsWs = null;
-                });
-            }
+            ws.on('close', () => {
+                if (upstreamTicksWs === ws) {
+                    upstreamTicksWs = null;
+                }
+                scheduleTicksReconnect();
+            });
         })
         .catch((err) => {
-            console.warn('[L3 Markets Stream Connect]:', err.response?.data || err.message);
+            console.warn('[L3 Markets Ticks Connect]:', err.response?.data || err.message);
+            scheduleTicksReconnect();
         });
+}
+
+function openEventsSocket(acct) {
+    if (upstreamEventsWs && (upstreamEventsWs.readyState === WebSocket.OPEN || upstreamEventsWs.readyState === WebSocket.CONNECTING)) {
+        return;
+    }
+
+    resolveAccessPoint(acct)
+        .then(({ accessPoint }) => {
+            const wsOrigin = accessPoint.replace(/^http(s?):\/\//i, (_, s) => (s ? 'wss://' : 'ws://'));
+            const eventsPath = `/v1/server-events/accounts/${encodeURIComponent(acct)}/ws/events`;
+            const evtHeaders = createSignedExnessHeaders(EXNESS_API_KEY, EXNESS_PRIVATE_KEY_RAW, 'GET', eventsPath, '');
+            const ws = new WebSocket(`${wsOrigin}${eventsPath}`, { headers: evtHeaders });
+            upstreamEventsWs = ws;
+
+            ws.on('open', () => {
+                eventsReconnectAttempts = 0;
+                ws.send(JSON.stringify({
+                    id: 'subscribe-transactions-1',
+                    subscribe: { event: 'transactions' }
+                }));
+                ws.send(JSON.stringify({
+                    id: 'subscribe-accounts-1',
+                    subscribe: { event: 'accounts' }
+                }));
+            });
+
+            ws.on('message', (raw) => {
+                try {
+                    const evt = JSON.parse(raw.toString());
+                    recentEvents.unshift({ receivedAt: new Date().toISOString(), event: evt });
+                    if (recentEvents.length > 100) recentEvents.pop();
+                    broadcastToClients({ type: 'EXNESS_EVENT', event: evt });
+                } catch (err) {
+                    console.warn('[L3 Markets Event Parse]:', err.message);
+                }
+            });
+
+            ws.on('error', (err) => {
+                console.warn('[L3 Markets Events WS Error]:', err.message);
+            });
+
+            ws.on('close', () => {
+                if (upstreamEventsWs === ws) {
+                    upstreamEventsWs = null;
+                }
+                scheduleEventsReconnect();
+            });
+        })
+        .catch((err) => {
+            console.warn('[L3 Markets Events Connect]:', err.response?.data || err.message);
+            scheduleEventsReconnect();
+        });
+}
+
+function connectExnessStreams(accountId, symbol = 'EURUSD') {
+    const acct = String(accountId || '').trim();
+    if (!/^\d+$/.test(acct) || !EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW || !hasValidGatewayUrl()) {
+        return;
+    }
+
+    if (activeStreamAccountId && activeStreamAccountId !== acct) {
+        if (upstreamTicksWs) {
+            upstreamTicksWs.terminate();
+            upstreamTicksWs = null;
+        }
+        if (upstreamEventsWs) {
+            upstreamEventsWs.terminate();
+            upstreamEventsWs = null;
+        }
+        if (ticksReconnectTimer) {
+            clearTimeout(ticksReconnectTimer);
+            ticksReconnectTimer = null;
+        }
+        if (eventsReconnectTimer) {
+            clearTimeout(eventsReconnectTimer);
+            eventsReconnectTimer = null;
+        }
+    }
+
+    activeStreamAccountId = acct;
+    subscribedTickSymbol = String(symbol || 'EURUSD').toUpperCase();
+
+    openTicksSocket(acct, subscribedTickSymbol);
+    openEventsSocket(acct);
 }
 
 async function fetchExnessAccountSummary(accountId, fallbackLabel = '') {
@@ -342,11 +511,38 @@ async function fetchExnessAccountSummary(accountId, fallbackLabel = '') {
         balance: 0,
         equity: 0,
         leverage: '',
-        status: 'Pending Discovery'
+        connected: false,
+        status: 'Disconnected'
     };
 
-    if (!/^\d+$/.test(acct) || !EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW) {
-        return { account: { ...baseRecord, status: 'Missing API Credentials or Account ID' }, accessPoint: null, rawConfig: null };
+    if (!/^\d+$/.test(acct)) {
+        return {
+            connected: false,
+            account: { ...baseRecord, status: 'Invalid Account ID' },
+            accessPoint: null,
+            rawConfig: null,
+            errorMessage: 'A valid numeric Exness Account ID is required.'
+        };
+    }
+
+    if (!hasValidGatewayUrl()) {
+        return {
+            connected: false,
+            account: { ...baseRecord, status: 'Missing Gateway URL' },
+            accessPoint: null,
+            rawConfig: null,
+            errorMessage: 'EXNESS_GATEWAY_URL must be set to the Gateway URL from Exness Key Management.'
+        };
+    }
+
+    if (!EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW) {
+        return {
+            connected: false,
+            account: { ...baseRecord, status: 'Missing API Credentials' },
+            accessPoint: null,
+            rawConfig: null,
+            errorMessage: 'EXNESS_API_KEY and EXNESS_PRIVATE_KEY must be configured in .env.'
+        };
     }
 
     try {
@@ -356,6 +552,7 @@ async function fetchExnessAccountSummary(accountId, fallbackLabel = '') {
         const cfg = res.data?.data || res.data || {};
 
         return {
+            connected: true,
             account: {
                 login: String(cfg.account_id ?? acct),
                 label: fallbackLabel || String(cfg.account_id ?? acct),
@@ -366,20 +563,28 @@ async function fetchExnessAccountSummary(accountId, fallbackLabel = '') {
                 leverage: cfg.leverage ? String(cfg.leverage) : '',
                 marginCallLevel: cfg.margin_call_level ?? null,
                 stopOutLevel: cfg.stop_out_level ?? null,
+                connected: true,
                 status: 'Connected'
             },
             accessPoint: discovery.accessPoint,
-            rawConfig: cfg
+            rawConfig: cfg,
+            errorMessage: null
         };
     } catch (err) {
-        console.warn('[L3 Markets Account Fetch]:', err.response?.status, err.response?.data || err.message);
+        const upstreamStatus = err.response?.status;
+        const detail = err.response?.data?.message || err.message || 'Connection failed';
+        console.warn('[L3 Markets Account Fetch]:', upstreamStatus || err.code || 'ERR', detail);
         return {
+            connected: false,
             account: {
                 ...baseRecord,
-                status: `Error (${err.response?.status || err.code || 'Gateway'})`
+                connected: false,
+                status: upstreamStatus ? `Failed (HTTP ${upstreamStatus})` : 'Connection Failed',
+                error: detail
             },
             accessPoint: accessPointCache.get(acct)?.accessPoint || null,
-            rawConfig: null
+            rawConfig: null,
+            errorMessage: detail
         };
     }
 }
@@ -389,26 +594,33 @@ function broadcastToClients(payloadObj) {
     const raw = JSON.stringify(payloadObj);
     wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
-            client.send(raw);
+            client.send(raw, (err) => {
+                if (err) console.warn('[L3 Markets Client WS Send]:', err.message);
+            });
         }
     });
 }
 
 wss.on('connection', (ws) => {
+    ws.on('error', (err) => {
+        console.warn('[L3 Markets Client WS Error]:', err.message);
+    });
     ws.send(JSON.stringify({
         type: 'SYSTEM_STATUS',
         platform: 'L3 Markets',
         status: 'CONNECTED',
-        discoveryBaseUrl: DISCOVERY_BASE_URL,
+        gatewayConfigured: hasValidGatewayUrl(),
         notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.'
     }));
 });
 
 app.get('/health', async (req, res) => {
     const accountId = String(req.query.account_id || DEFAULT_ACCOUNT_ID || '').trim();
+    const gatewayReady = hasValidGatewayUrl();
+    const credentialsReady = Boolean(EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW);
     let accessPoint = accessPointCache.get(accountId)?.accessPoint || null;
 
-    if (!accessPoint && /^\d+$/.test(accountId) && EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW) {
+    if (!accessPoint && /^\d+$/.test(accountId) && gatewayReady && credentialsReady) {
         try {
             const disc = await resolveAccessPoint(accountId);
             accessPoint = disc.accessPoint;
@@ -419,17 +631,17 @@ app.get('/health', async (req, res) => {
         status: 'ONLINE',
         platform: 'L3 Markets',
         broker: 'Exness',
-        discoveryBaseUrl: DISCOVERY_BASE_URL,
+        gatewayConfigured: gatewayReady,
         accessPoint,
         accountConfigured: /^\d+$/.test(accountId),
-        credentialsLoadedFromEnv: Boolean(EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW),
+        credentialsLoadedFromEnv: credentialsReady,
         notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.',
         timestamp: new Date().toISOString()
     });
 });
 
-app.get('/api/exness/access-point', async (req, res) => {
-    const accountId = String(req.query.account_id || '').trim();
+app.get('/api/exness/access-point', requireValidSession, async (req, res) => {
+    const accountId = String(req.query.account_id || req.session.accountId || '').trim();
     if (!/^\d+$/.test(accountId)) {
         return res.status(400).json({
             success: false,
@@ -465,19 +677,29 @@ app.post('/api/exness/login', async (req, res) => {
         });
     }
 
-    const sessionToken = `l3_session_${crypto.randomBytes(16).toString('hex')}`;
-
     try {
         const summary = await fetchExnessAccountSummary(accountId, label || accountId);
+        if (!summary.connected) {
+            return res.status(502).json({
+                success: false,
+                connected: false,
+                message: summary.errorMessage || 'Failed to connect to Exness account.',
+                account_id: accountId,
+                access_point: summary.accessPoint,
+                accounts: [summary.account]
+            });
+        }
+
+        const sessionToken = issueSessionToken(accountId, label || accountId);
         connectExnessStreams(accountId, subscribedTickSymbol);
 
         return res.json({
             success: true,
+            connected: true,
             platform: 'L3 Markets',
             token: sessionToken,
             user: label || accountId,
             account_id: accountId,
-            discovery_base_url: DISCOVERY_BASE_URL,
             access_point: summary.accessPoint,
             notice: 'All trades, positions, account balances, and market data are handled, processed, and kept directly by Exness.',
             accounts: [summary.account],
@@ -487,32 +709,42 @@ app.post('/api/exness/login', async (req, res) => {
         console.error('[L3 Markets Login Error]:', error.message);
         return res.status(500).json({
             success: false,
+            connected: false,
             message: error.message || 'Failed to initialize Exness session.'
         });
     }
 });
 
-app.post('/api/exness/refresh-session', async (req, res) => {
-    const token = String(req.body.token || '').trim();
-    const accountId = String(req.body.accountId || req.body.account_id || '').trim();
-    const label = String(req.body.label || req.body.email || '').trim();
+app.post('/api/exness/refresh-session', requireValidSession, async (req, res) => {
+    const accountId = String(req.body.accountId || req.body.account_id || req.session.accountId || '').trim();
+    const label = String(req.body.label || req.body.email || req.session.label || '').trim();
 
-    if (!token) {
-        return res.status(401).json({ success: false, message: 'Session token required.' });
-    }
     if (!/^\d+$/.test(accountId)) {
         return res.status(400).json({ success: false, message: 'Valid numeric accountId is required.' });
     }
 
     try {
         const summary = await fetchExnessAccountSummary(accountId, label || accountId);
+        if (!summary.connected) {
+            return res.status(502).json({
+                success: false,
+                connected: false,
+                message: summary.errorMessage || 'Failed to refresh Exness account connection.',
+                user: label || accountId,
+                account_id: accountId,
+                access_point: summary.accessPoint,
+                accounts: [summary.account],
+                recentEvents
+            });
+        }
+
         connectExnessStreams(accountId, subscribedTickSymbol);
 
         return res.json({
             success: true,
+            connected: true,
             user: label || accountId,
             account_id: accountId,
-            discovery_base_url: DISCOVERY_BASE_URL,
             access_point: summary.accessPoint,
             accounts: [summary.account],
             recentEvents
@@ -521,9 +753,19 @@ app.post('/api/exness/refresh-session', async (req, res) => {
         console.error('[L3 Markets Refresh Error]:', error.message);
         return res.status(500).json({
             success: false,
+            connected: false,
             message: error.message || 'Failed to refresh Exness session.'
         });
     }
+});
+
+app.get('/api/exness/events', requireValidSession, (req, res) => {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+    return res.json({
+        success: true,
+        account_id: req.session.accountId,
+        events: recentEvents.slice(0, limit)
+    });
 });
 
 app.get('/api/exness/candles', async (req, res) => {
@@ -531,6 +773,13 @@ app.get('/api/exness/candles', async (req, res) => {
     const timeframe = String(req.query.timeframe || '1m').trim();
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 300);
     const accountId = String(req.query.account_id || '').trim();
+
+    if (!VALID_TIMEFRAMES.has(timeframe)) {
+        return res.status(400).json({
+            success: false,
+            message: `Invalid timeframe "${timeframe}". Supported timeframes: ${[...VALID_TIMEFRAMES].join(', ')}.`
+        });
+    }
 
     if (/^\d+$/.test(accountId)) {
         connectExnessStreams(accountId, symbol);
@@ -549,39 +798,55 @@ app.get('/api/exness/candles', async (req, res) => {
     });
 });
 
-app.post('/api/exness/instruments', async (req, res) => {
-    const accountId = String(req.body.accountId || req.body.account_id || '').trim();
+app.post('/api/exness/instruments', requireValidSession, async (req, res) => {
+    const accountId = String(req.body.accountId || req.body.account_id || req.session.accountId || '').trim();
 
-    if (/^\d+$/.test(accountId) && EXNESS_API_KEY && EXNESS_PRIVATE_KEY_RAW) {
-        try {
-            const discovery = await resolveAccessPoint(accountId);
-            const pathAndQuery = `/v1/trading/accounts/${encodeURIComponent(accountId)}/instruments`;
-            const response = await signedRestRequest(discovery.accessPoint, 'GET', pathAndQuery);
-            const list = Array.isArray(response.data)
-                ? response.data
-                : response.data?.instruments || response.data?.items || response.data?.data || [];
-
-            if (Array.isArray(list) && list.length > 0) {
-                return res.json({
-                    success: true,
-                    source: 'exness',
-                    instruments: { exness_instruments: list }
-                });
-            }
-        } catch (err) {
-            console.warn('[L3 Markets Instruments]:', err.response?.status, err.response?.data || err.message);
-        }
+    if (!/^\d+$/.test(accountId)) {
+        return res.status(400).json({
+            success: false,
+            message: 'A valid numeric accountId is required to fetch instruments.'
+        });
     }
 
-    return res.json({
-        success: true,
-        source: 'none',
-        instruments: {}
-    });
+    if (!EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW || !hasValidGatewayUrl()) {
+        return res.status(503).json({
+            success: false,
+            message: 'Exness Gateway URL or API credentials are not configured on the server.'
+        });
+    }
+
+    try {
+        const discovery = await resolveAccessPoint(accountId);
+        const pathAndQuery = `/v1/trading/accounts/${encodeURIComponent(accountId)}/instruments`;
+        const response = await signedRestRequest(discovery.accessPoint, 'GET', pathAndQuery);
+        const list = Array.isArray(response.data)
+            ? response.data
+            : response.data?.instruments || response.data?.items || response.data?.data || [];
+
+        if (!Array.isArray(list)) {
+            return res.status(502).json({
+                success: false,
+                message: 'Unexpected instruments payload format from Exness.'
+            });
+        }
+
+        return res.json({
+            success: true,
+            source: 'exness',
+            instruments: { exness_instruments: list }
+        });
+    } catch (err) {
+        const statusCode = err.response?.status || 502;
+        console.warn('[L3 Markets Instruments]:', statusCode, err.response?.data || err.message);
+        return res.status(statusCode).json({
+            success: false,
+            message: err.response?.data?.message || err.message || 'Failed to retrieve instruments from Exness.'
+        });
+    }
 });
 
-app.post('/api/exness/trade', async (req, res) => {
-    const accountId = String(req.body.accountId || req.body.account_id || '').trim();
+app.post('/api/exness/trade', requireValidSession, async (req, res) => {
+    const accountId = String(req.body.accountId || req.body.account_id || req.session.accountId || '').trim();
     const instrument = String(req.body.symbol || req.body.instrument || '').trim().toUpperCase();
     const volume = String(req.body.volume ?? '').trim();
     const side = String(req.body.side || req.body.orderType || '').trim().toLowerCase();
@@ -635,6 +900,6 @@ app.post('/api/exness/trade', async (req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
     console.log('============================================================');
     console.log(` L3 Markets Engine listening on port ${PORT}`);
-    console.log(` Discovery Gateway Base URL: ${DISCOVERY_BASE_URL}`);
+    console.log(` Key Management Gateway URL: ${GATEWAY_URL || 'NOT SET'}`);
     console.log('============================================================');
 });
