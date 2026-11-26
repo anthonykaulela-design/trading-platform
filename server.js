@@ -3,6 +3,7 @@
  * L3 MARKETS - Exness API Backend Engine
  * Ed25519 Signing • Key Management Gateway • Account & Positions • Live WS Ticks
  * Credentials & Gateway URL loaded strictly from .env
+ * All instruments, ticks, and market data sourced from Exness.
  * ============================================================================
  */
 
@@ -40,12 +41,13 @@ const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const accessPointCache = new Map();
 const latestTicks = new Map();
 const candleSeries = new Map();
+const exnessInstrumentsCache = new Map();
 const activeSessions = new Map();
 const recentEvents = [];
 
 let upstreamTicksWs = null;
 let upstreamEventsWs = null;
-let subscribedTickSymbol = 'EURUSD';
+let subscribedTickSymbol = '';
 let activeStreamAccountId = '';
 let ticksReconnectTimer = null;
 let eventsReconnectTimer = null;
@@ -294,7 +296,7 @@ function timeframeToMs(tf) {
     return map[tf];
 }
 
-function recordTickIntoCandles(symbol, bid, ask, tsMs = Date.now()) {
+function recordExnessTick(symbol, bid, ask, tsMs = Date.now()) {
     const sym = String(symbol || '').toUpperCase();
     const mid = Number.isFinite(bid) && Number.isFinite(ask)
         ? (bid + ask) / 2
@@ -307,6 +309,7 @@ function recordTickIntoCandles(symbol, bid, ask, tsMs = Date.now()) {
         bid: Number.isFinite(bid) ? bid : mid,
         ask: Number.isFinite(ask) ? ask : mid,
         mid,
+        source: 'exness',
         timestamp: tsMs
     });
 
@@ -331,7 +334,7 @@ function recordTickIntoCandles(symbol, bid, ask, tsMs = Date.now()) {
 
 function scheduleTicksReconnect() {
     if (ticksReconnectTimer) return;
-    if (!/^\d+$/.test(activeStreamAccountId)) return;
+    if (!/^\d+$/.test(activeStreamAccountId) || !subscribedTickSymbol) return;
     const delayMs = Math.min(1000 * (2 ** ticksReconnectAttempts), 30000);
     ticksReconnectAttempts += 1;
     ticksReconnectTimer = setTimeout(() => {
@@ -352,13 +355,16 @@ function scheduleEventsReconnect() {
 }
 
 function openTicksSocket(acct, symbol) {
+    const sym = String(symbol || '').toUpperCase();
+    if (!sym) return;
+
     if (upstreamTicksWs && (upstreamTicksWs.readyState === WebSocket.OPEN || upstreamTicksWs.readyState === WebSocket.CONNECTING)) {
         if (upstreamTicksWs.readyState === WebSocket.OPEN) {
             upstreamTicksWs.send(JSON.stringify({
-                id: `ticks-${symbol.toLowerCase()}-${Date.now()}`,
+                id: `ticks-${sym.toLowerCase()}-${Date.now()}`,
                 subscribe: {
                     event: 'ticks',
-                    instruments: [symbol]
+                    instruments: [sym]
                 }
             }));
         }
@@ -376,7 +382,7 @@ function openTicksSocket(acct, symbol) {
             ws.on('open', () => {
                 ticksReconnectAttempts = 0;
                 ws.send(JSON.stringify({
-                    id: `ticks-${symbol.toLowerCase()}-1`,
+                    id: `ticks-${subscribedTickSymbol.toLowerCase()}-1`,
                     subscribe: {
                         event: 'ticks',
                         instruments: [subscribedTickSymbol]
@@ -388,12 +394,20 @@ function openTicksSocket(acct, symbol) {
                 try {
                     const msg = JSON.parse(raw.toString());
                     const payload = msg.data || msg.tick || msg;
-                    const sym = String(payload.instrument || payload.symbol || subscribedTickSymbol).toUpperCase();
+                    const tickSym = String(payload.instrument || payload.symbol || subscribedTickSymbol).toUpperCase();
                     const bid = Number(payload.bid ?? payload.b ?? payload.price);
                     const ask = Number(payload.ask ?? payload.a ?? bid);
                     const ts = Number(payload.timestamp || payload.t || Date.now());
-                    recordTickIntoCandles(sym, bid, ask, ts < 1e12 ? ts * 1000 : ts);
-                    broadcastToClients({ type: 'TICK', symbol: sym, bid, ask, timestamp: ts });
+                    const tsMs = ts < 1e12 ? ts * 1000 : ts;
+                    recordExnessTick(tickSym, bid, ask, tsMs);
+                    broadcastToClients({
+                        type: 'TICK',
+                        source: 'exness',
+                        symbol: tickSym,
+                        bid,
+                        ask,
+                        timestamp: tsMs
+                    });
                 } catch (err) {
                     console.warn('[L3 Markets Ticks Parse]:', err.message);
                 }
@@ -446,7 +460,7 @@ function openEventsSocket(acct) {
                     const evt = JSON.parse(raw.toString());
                     recentEvents.unshift({ receivedAt: new Date().toISOString(), event: evt });
                     if (recentEvents.length > 100) recentEvents.pop();
-                    broadcastToClients({ type: 'EXNESS_EVENT', event: evt });
+                    broadcastToClients({ type: 'EXNESS_EVENT', source: 'exness', event: evt });
                 } catch (err) {
                     console.warn('[L3 Markets Event Parse]:', err.message);
                 }
@@ -469,7 +483,7 @@ function openEventsSocket(acct) {
         });
 }
 
-function connectExnessStreams(accountId, symbol = 'EURUSD') {
+function connectExnessStreams(accountId, symbol = '') {
     const acct = String(accountId || '').trim();
     if (!/^\d+$/.test(acct) || !EXNESS_API_KEY || !EXNESS_PRIVATE_KEY_RAW || !hasValidGatewayUrl()) {
         return;
@@ -495,9 +509,13 @@ function connectExnessStreams(accountId, symbol = 'EURUSD') {
     }
 
     activeStreamAccountId = acct;
-    subscribedTickSymbol = String(symbol || 'EURUSD').toUpperCase();
+    if (symbol) {
+        subscribedTickSymbol = String(symbol).toUpperCase();
+    }
 
-    openTicksSocket(acct, subscribedTickSymbol);
+    if (subscribedTickSymbol) {
+        openTicksSocket(acct, subscribedTickSymbol);
+    }
     openEventsSocket(acct);
 }
 
@@ -572,8 +590,16 @@ async function fetchExnessAccountSummary(accountId, fallbackLabel = '') {
         };
     } catch (err) {
         const upstreamStatus = err.response?.status;
-        const detail = err.response?.data?.message || err.message || 'Connection failed';
-        console.warn('[L3 Markets Account Fetch]:', upstreamStatus || err.code || 'ERR', detail);
+        const upstreamBody = err.response?.data;
+        const detail =
+            (typeof upstreamBody === 'string' ? upstreamBody : upstreamBody?.message || upstreamBody?.error) ||
+            err.message ||
+            'Connection failed';
+        console.warn(
+            '[L3 Markets Account Fetch]:',
+            upstreamStatus ? `${upstreamStatus} Request failed with status code ${upstreamStatus}` : (err.code || 'ERR'),
+            typeof upstreamBody === 'object' && upstreamBody !== null ? JSON.stringify(upstreamBody) : detail
+        );
         return {
             connected: false,
             account: {
@@ -584,7 +610,9 @@ async function fetchExnessAccountSummary(accountId, fallbackLabel = '') {
             },
             accessPoint: accessPointCache.get(acct)?.accessPoint || null,
             rawConfig: null,
-            errorMessage: detail
+            errorMessage: upstreamStatus === 401
+                ? `Exness rejected request with HTTP 401 (${detail}). Verify EXNESS_API_KEY, EXNESS_PRIVATE_KEY, EXNESS_GATEWAY_URL, server clock sync, and account permissions.`
+                : detail
         };
     }
 }
@@ -680,7 +708,7 @@ app.post('/api/exness/login', async (req, res) => {
     try {
         const summary = await fetchExnessAccountSummary(accountId, label || accountId);
         if (!summary.connected) {
-            return res.status(502).json({
+            return res.status(summary.account.error && summary.account.error.includes('401') ? 401 : 502).json({
                 success: false,
                 connected: false,
                 message: summary.errorMessage || 'Failed to connect to Exness account.',
@@ -768,11 +796,18 @@ app.get('/api/exness/events', requireValidSession, (req, res) => {
     });
 });
 
-app.get('/api/exness/candles', async (req, res) => {
-    const symbol = String(req.query.symbol || 'EURUSD').trim().toUpperCase();
+app.get('/api/exness/candles', requireValidSession, async (req, res) => {
+    const symbol = String(req.query.symbol || '').trim().toUpperCase();
     const timeframe = String(req.query.timeframe || '1m').trim();
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 300);
-    const accountId = String(req.query.account_id || '').trim();
+    const accountId = String(req.query.account_id || req.session.accountId || '').trim();
+
+    if (!symbol) {
+        return res.status(400).json({
+            success: false,
+            message: 'symbol query parameter is required to fetch Exness market data.'
+        });
+    }
 
     if (!VALID_TIMEFRAMES.has(timeframe)) {
         return res.status(400).json({
@@ -792,7 +827,7 @@ app.get('/api/exness/candles', async (req, res) => {
         success: true,
         symbol,
         timeframe,
-        source: 'exness_ws_ticks',
+        source: 'exness',
         latestTick: latestTicks.get(symbol) || null,
         candles
     });
@@ -804,7 +839,7 @@ app.post('/api/exness/instruments', requireValidSession, async (req, res) => {
     if (!/^\d+$/.test(accountId)) {
         return res.status(400).json({
             success: false,
-            message: 'A valid numeric accountId is required to fetch instruments.'
+            message: 'A valid numeric accountId is required to fetch instruments from Exness.'
         });
     }
 
@@ -829,6 +864,8 @@ app.post('/api/exness/instruments', requireValidSession, async (req, res) => {
                 message: 'Unexpected instruments payload format from Exness.'
             });
         }
+
+        exnessInstrumentsCache.set(accountId, list);
 
         return res.json({
             success: true,
